@@ -110,12 +110,62 @@ const buildModel = (): { model: LanguageModel; modelId: string } => {
   }
 };
 
-const built = buildModel();
+let cachedModel: LanguageModel | undefined;
 
-/** The single language model the whole bot uses. */
-export const llm: LanguageModel = built.model;
+/**
+ * Lazily build (and memoize) the active model on first use.
+ *
+ * Initialization is deferred until the model is actually accessed. ESM imports
+ * are hoisted and run before the entry point's body, so building eagerly at the
+ * top level could read `process.env` before `dotenv/config` has populated it —
+ * leading to "missing key" errors or wrong defaults. First access happens well
+ * after startup, by which point the environment is loaded.
+ */
+const getModel = (): LanguageModel => {
+  if (!cachedModel) {
+    const built = buildModel();
+    cachedModel = built.model;
+    logger.info(`🤖 AI provider: ${ACTIVE_PROVIDER} (model: ${built.modelId})`);
+  }
+  return cachedModel;
+};
 
-logger.info(`🤖 AI provider: ${ACTIVE_PROVIDER} (model: ${built.modelId})`);
+/**
+ * The single language model the whole bot uses.
+ *
+ * A transparent lazy proxy: the real model is created on first property access
+ * via {@link getModel} and then reused. Methods are read/bound against the real
+ * model (not the proxy) so providers that rely on private fields keep working.
+ */
+// `LanguageModel` is `string | LanguageModelV2`; in this module it is always the
+// object form, so the proxy treats the resolved model as a plain object.
+const getModelObject = (): object => getModel() as unknown as object;
+
+export const llm: LanguageModel = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      const model = getModelObject();
+      const value = Reflect.get(model, prop, model);
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(model) : value;
+    },
+    has(_target, prop) {
+      return Reflect.has(getModelObject(), prop);
+    },
+    ownKeys() {
+      return Reflect.ownKeys(getModelObject());
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(getModelObject(), prop);
+      if (descriptor) {
+        // The proxy target is an empty object, so any reported own property must
+        // be configurable to satisfy the Proxy invariant.
+        descriptor.configurable = true;
+      }
+      return descriptor;
+    },
+  },
+) as unknown as LanguageModel;
 
 /**
  * Provider-specific options for the agentic `generateText` loop.
