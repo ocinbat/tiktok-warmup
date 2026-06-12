@@ -165,9 +165,39 @@ pnpm install
 
 # Setup environment
 cp .env.example .env
-# Add API key:
+# Add API key (default provider is Google Gemini):
 # GOOGLE_GENERATIVE_AI_API_KEY=your_gemini_api_key_here
 ```
+
+### AI Providers (multi-provider)
+
+The bot talks to a single language model, selected with the `AI_PROVIDER` env var.
+Leave it unset to keep the original Google Gemini behavior. Supported values:
+
+| `AI_PROVIDER` | Backend | Required env | Notes |
+|---|---|---|---|
+| `google` *(default)* | Google Gemini | `GOOGLE_GENERATIVE_AI_API_KEY` | Original behavior, unchanged |
+| `minimax` | MiniMax | `MINIMAX_API_KEY` | See vision note below |
+| `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | |
+| `openai-compatible` | Any OpenAI-style API | `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_MODEL` | OpenRouter, local servers, etc. |
+
+> ⚠️ **Vision is required.** This bot drives the UI by sending device screenshots
+> to the model, so the selected model **must accept image input**. For MiniMax,
+> only **`MiniMax-M3`** is multimodal — `MiniMax-M2` / `M2.1` will not work.
+
+**MiniMax (Coding / Token Plan):**
+```bash
+AI_PROVIDER=minimax
+MINIMAX_API_KEY=your_subscription_key   # from the MiniMax Coding/Token Plan
+MINIMAX_MODEL=MiniMax-M3                 # only vision-capable MiniMax model
+MINIMAX_API_STYLE=anthropic             # subscription key uses the Anthropic-compatible endpoint
+# China mainland users: MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1
+```
+Use `MINIMAX_API_STYLE=openai` instead if you are billing a pay-as-you-go
+platform key against `https://api.minimax.io/v1`.
+
+See `.env.example` for every variable. All providers are wired through the AI
+SDK in `src/config/providers.ts`.
 
 ### Device Setup
 ```bash

@@ -1,10 +1,9 @@
 /* eslint-disable no-duplicate-imports */
-import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { ToolSet} from "ai";
 import { generateObject, generateText, hasToolCall, stepCountIs } from "ai";
 import { z } from "zod";
 
-import { llm } from "./llm.js";
+import { getThinkingProviderOptions, llm } from "./llm.js";
 import { logger, uuidv4 } from "./utils.js";
 
 import type { DeviceManager } from "@/core/DeviceManager.js";
@@ -153,11 +152,7 @@ export async function interactWithScreen<T>(
       generateText({
         model: llm,
         prompt,
-        providerOptions: {
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        } satisfies GoogleGenerativeAIProviderOptions,
+        providerOptions: getThinkingProviderOptions(),
         stopWhen: [hasToolCall('finish_task'), stepCountIs(20)],
         
         tools: {
