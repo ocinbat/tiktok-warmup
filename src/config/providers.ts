@@ -125,9 +125,9 @@ logger.info(`🤖 AI provider: ${ACTIVE_PROVIDER} (model: ${built.modelId})`);
  * `undefined`), which is the safe default — sending Google-specific options to
  * MiniMax/Anthropic would be ignored or rejected.
  */
-export const getThinkingProviderOptions = (): { thinkingConfig: { thinkingBudget: number } } | undefined => {
+export const getThinkingProviderOptions = (): { google: { thinkingConfig: { thinkingBudget: number } } } | undefined => {
   if (ACTIVE_PROVIDER === 'google') {
-    return { thinkingConfig: { thinkingBudget: 0 } };
+    return { google: { thinkingConfig: { thinkingBudget: 0 } } };
   }
   return undefined;
 };
