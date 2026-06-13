@@ -1,4 +1,6 @@
 import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 import type { ToolSet } from 'ai';
 import { z } from 'zod';
@@ -53,8 +55,10 @@ export class DeviceManager {
    */
   async takeScreenshot(deviceId: string): Promise<string> {
     const tempPath = `/sdcard/screenshot_${Date.now()}.png`;
-    const localTempFile = `/tmp/screenshot_${deviceId}_${Date.now()}.png`;
-    
+    // os.tmpdir() resolves to the OS temp dir on every platform (e.g. %TEMP% on
+    // Windows). A hardcoded /tmp does not exist on Windows.
+    const localTempFile = path.join(os.tmpdir(), `screenshot_${deviceId}_${Date.now()}.png`);
+
     try {
       // Take screenshot on device
       await execAsync(`adb -s ${deviceId} shell screencap -p ${tempPath}`);
@@ -233,26 +237,34 @@ export class DeviceManager {
    * Verify ADB is installed and accessible
    */
   private async verifyAdbInstalled(): Promise<void> {
+    const isWin = process.platform === 'win32';
+    const adbExe = isWin ? 'adb.exe' : 'adb';
+    const sdkRoot = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT;
     const adbPaths = [
       'adb',
-      '/opt/homebrew/bin/adb',
-      '/usr/local/bin/adb',
-      process.env.ANDROID_HOME ? `${process.env.ANDROID_HOME}/platform-tools/adb` : null,
-    ].filter(Boolean);
+      sdkRoot ? path.join(sdkRoot, 'platform-tools', adbExe) : null,
+      // Common per-OS install locations as a last resort.
+      isWin ? path.join(process.env.LOCALAPPDATA ?? '', 'Android', 'Sdk', 'platform-tools', adbExe) : null,
+      isWin ? null : '/opt/homebrew/bin/adb',
+      isWin ? null : '/usr/local/bin/adb',
+    ].filter((p): p is string => Boolean(p));
 
     for (const adbPath of adbPaths) {
       try {
-        const result = await execAsync(`${adbPath} version`);
+        // Quote the path in case it contains spaces (e.g. C:\Users\Foo Bar\...).
+        const cmd = adbPath.includes(' ') ? `"${adbPath}" version` : `${adbPath} version`;
+        const result = await execAsync(cmd);
         if (result.stdout?.includes('Android Debug Bridge') || result.stderr?.includes('Android Debug Bridge')) {
           logger.debug(`✅ ADB verified and working at: ${adbPath}`);
           // The rest of the code invokes `adb` as a bare command, so ensure the
           // directory that actually contains it is on PATH for child processes
-          // (e.g. when adb lives under $ANDROID_HOME/platform-tools but not PATH).
-          if (adbPath && adbPath !== 'adb') {
-            const adbDir = adbPath.slice(0, adbPath.lastIndexOf('/'));
+          // (e.g. when adb lives under the SDK platform-tools dir but not PATH).
+          if (adbPath !== 'adb') {
+            const adbDir = path.dirname(adbPath);
             const currentPath = process.env.PATH ?? '';
-            if (adbDir && !currentPath.split(':').includes(adbDir)) {
-              process.env.PATH = `${adbDir}:${currentPath}`;
+            const entries = currentPath.split(path.delimiter);
+            if (adbDir && !entries.includes(adbDir)) {
+              process.env.PATH = `${adbDir}${path.delimiter}${currentPath}`;
               logger.debug(`Added ADB directory to PATH: ${adbDir}`);
             }
           }

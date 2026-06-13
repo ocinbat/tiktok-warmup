@@ -21,7 +21,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "dev": "DEBUG=agent:* tsx src/index.ts",
+    "dev": "tsx src/index.ts --debug",
     "start": "tsx src/index.ts",
     "test-scan": "tsx src/index.ts --help",
     "build": "tsup",

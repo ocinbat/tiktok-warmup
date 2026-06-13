@@ -1,5 +1,7 @@
 /* eslint-disable default-case */
 /* eslint-disable @typescript-eslint/no-misused-promises */
+import { pathToFileURL } from 'node:url';
+
 import 'dotenv/config';
 import { AUTOMATION_PRESETS } from './config/presets.js';
 import { AgentManager } from './core/AgentManager.js';
@@ -370,8 +372,11 @@ Examples:
   await bot.start();
 }
 
-// Start the bot if this file is run directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Start the bot if this file is run directly.
+// NOTE: comparing against `file://${process.argv[1]}` breaks on Windows because
+// import.meta.url is a proper file URL (file:///C:/...) while argv[1] is a native
+// path (C:\...). pathToFileURL normalizes both, so this works cross-platform.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(error => {
     console.error('💥 Fatal error:', error);
     process.exit(1);

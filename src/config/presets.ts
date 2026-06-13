@@ -86,9 +86,9 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
   },
   
   control: {
-    healthCheckInterval: 10, // Every 10 videos check screen if it is healthy and looks like TikTok feed
+    healthCheckInterval: 100, // Every 100 videos check screen if it is healthy and looks like TikTok feed
     maxHealthFailures: 3, // Max 3 health check failures before retraining UI coordinates
-    shadowBanInterval: 50, // Every 50 videos check if the account is shadow banned
+    shadowBanInterval: 200, // Every 200 videos check if the account is shadow banned
     maxConsecutiveErrors: 5, // Max 5 consecutive errors before stopping
   },
 }; 
