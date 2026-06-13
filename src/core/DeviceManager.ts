@@ -245,6 +245,17 @@ export class DeviceManager {
         const result = await execAsync(`${adbPath} version`);
         if (result.stdout?.includes('Android Debug Bridge') || result.stderr?.includes('Android Debug Bridge')) {
           logger.debug(`✅ ADB verified and working at: ${adbPath}`);
+          // The rest of the code invokes `adb` as a bare command, so ensure the
+          // directory that actually contains it is on PATH for child processes
+          // (e.g. when adb lives under $ANDROID_HOME/platform-tools but not PATH).
+          if (adbPath && adbPath !== 'adb') {
+            const adbDir = adbPath.slice(0, adbPath.lastIndexOf('/'));
+            const currentPath = process.env.PATH ?? '';
+            if (adbDir && !currentPath.split(':').includes(adbDir)) {
+              process.env.PATH = `${adbDir}:${currentPath}`;
+              logger.debug(`Added ADB directory to PATH: ${adbDir}`);
+            }
+          }
           return;
         }
       } catch (error) {
