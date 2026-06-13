@@ -5,5 +5,5 @@
  * by the `AI_PROVIDER` env var. This file stays as the stable import surface
  * (`./llm.js`) so the rest of the codebase does not need to change.
  */
-export { ACTIVE_PROVIDER, getThinkingProviderOptions, llm } from '../config/providers.js';
+export { ACTIVE_PROVIDER, getThinkingProviderOptions, llm, VISION_PROVIDER, visionLlm } from '../config/providers.js';
 export type { ProviderName } from '../config/providers.js';

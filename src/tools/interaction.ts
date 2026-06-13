@@ -1,12 +1,106 @@
 /* eslint-disable no-duplicate-imports */
-import type { ToolSet} from "ai";
+import type { ModelMessage, ToolSet } from "ai";
 import { generateObject, generateText, hasToolCall, stepCountIs } from "ai";
 import { z } from "zod";
 
-import { getThinkingProviderOptions, llm } from "./llm.js";
+import { getThinkingProviderOptions, llm, visionLlm } from "./llm.js";
 import { logger, uuidv4 } from "./utils.js";
 
 import type { DeviceManager } from "@/core/DeviceManager.js";
+
+
+/**
+ * Max tool-use steps for one interactWithScreen run before we stop the agent.
+ * Slower / more exploratory models (e.g. MiniMax M3) need more headroom than
+ * the original 20. Override with AGENT_MAX_STEPS.
+ */
+const AGENT_MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 40;
+
+/** True for the AI SDK error thrown when the model returns no parseable object. */
+const isNoObjectGenerated = (error: unknown): boolean =>
+  error instanceof Error && error.name === 'AI_NoObjectGeneratedError';
+
+/** Best-effort shape hint for a Zod object schema, used in the JSON fallback prompt. */
+const describeSchemaShape = (schema: z.ZodTypeAny): string => {
+  if (schema instanceof z.ZodObject) {
+    const shape = schema.shape as Record<string, z.ZodTypeAny>;
+    const fields = Object.entries(shape).map(([key, value]) => {
+      const description = value.description ? ` // ${value.description}` : '';
+      return `  "${key}": ...${description}`;
+    });
+    return `{\n${fields.join('\n')}\n}`;
+  }
+  return 'a single JSON object';
+};
+
+/** Pull the first complete JSON object out of a possibly-noisy text response. */
+const extractJsonObject = (text: string): string => {
+  let candidate = text.trim();
+  const fenced = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) candidate = fenced[1].trim();
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start !== -1 && end > start) return candidate.slice(start, end + 1);
+  return candidate;
+};
+
+/**
+ * Generate a schema-validated object from the model.
+ *
+ * Primary path is the AI SDK's generateObject. Some providers (notably MiniMax
+ * M3 over the Anthropic-compatible endpoint) intermittently return prose /
+ * reasoning instead of the structured object, surfacing as
+ * NoObjectGeneratedError. In that case we fall back to a plain text completion
+ * instructed to emit only JSON, then parse and validate it against the same
+ * schema. Providers that already return clean objects (e.g. Gemini) never reach
+ * the fallback, so their behavior is unchanged.
+ */
+async function generateStructured<T>(params: {
+  messages: ModelMessage[];
+  // Input decoupled from output so schemas using .default() infer T as the output type.
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>;
+  schemaName?: string;
+  schemaDescription?: string;
+}): Promise<T> {
+  const { messages, schema, schemaName, schemaDescription } = params;
+  try {
+    // Cast to a concrete schema type so generateObject's output-mode overload
+    // resolves (it can't infer "object" vs "enum" from a generic T).
+    const result = await generateObject({
+      model: visionLlm,
+      messages,
+      schema: schema as z.ZodType<unknown>,
+      schemaName,
+      schemaDescription,
+    });
+    return result.object as T;
+  } catch (error) {
+    if (!isNoObjectGenerated(error)) throw error;
+
+    logger.warn(`⚠️ Structured output missing; falling back to text+JSON parse (${schemaName ?? 'object'})`);
+    const jsonInstruction =
+      `Respond with ONLY a single valid JSON object and nothing else — no prose, no explanation, ` +
+      `no markdown code fences. The JSON must match this shape:\n${describeSchemaShape(schema)}`;
+
+    // Merge all system content (plus the JSON instruction) into a single leading
+    // system message. Anthropic / MiniMax reject a system message that appears
+    // after a user/assistant turn, so we cannot just append one at the end.
+    const systemParts: string[] = [];
+    const otherMessages: ModelMessage[] = [];
+    for (const message of messages) {
+      if (message.role === 'system') systemParts.push(message.content);
+      else otherMessages.push(message);
+    }
+    systemParts.push(jsonInstruction);
+    const fallbackMessages: ModelMessage[] = [
+      { role: 'system', content: systemParts.join('\n\n') },
+      ...otherMessages,
+    ];
+    const { text } = await generateText({ model: visionLlm, messages: fallbackMessages });
+    const parsed: unknown = JSON.parse(extractJsonObject(text));
+    return schema.parse(parsed);
+  }
+}
 
 
 /**
@@ -27,12 +121,11 @@ const convertToPixelCoordinates = (normalizedCoords: { y1: number, x1: number, y
 
 const analyzeScreenshot = async (taskId: string, screenshot: string, query: string) => {
   logger.info(`🔍 [Interacting#${taskId}] Analyzing screenshot: ${query}`);
-  const result = await generateObject({
-    model: llm,
+  const analysisResult = await generateStructured({
     messages: [
       {
         role: 'system',
-        content: `You are a visual LLM for object detection and spatial understanding. 
+        content: `You are a visual LLM for object detection and spatial understanding.
         You are analyzing a TikTok app screenshot to find UI elements and answer any question from orechstation LLM agent who will ask you to analyze the screenshot.
         `,
       },
@@ -54,7 +147,6 @@ const analyzeScreenshot = async (taskId: string, screenshot: string, query: stri
     schemaDescription: 'Analysis screenshot result',
   });
 
-  const analysisResult = result.object;
   logger.info(`🔍 [Interacting#${taskId}] Analysis result:`, analysisResult);
   return analysisResult;
 };
@@ -66,16 +158,15 @@ const findObject = async (taskId: string, deviceId: string, deviceManager: Devic
     const capabilities = await deviceManager.getDeviceCapabilities(deviceId);
     const { width: screenWidth, height: screenHeight } = capabilities.screenResolution;
     
-    const result = await generateObject({
-      model: llm,
+    const detection = await generateStructured({
       messages: [
         {
           role: 'system',
           content: `
-          You are a visual LLM for object detection and spatial understanding. 
+          You are a visual LLM for object detection and spatial understanding.
           Return bounding box coordinates in format [y1, x1, y2, x2] normalized to 0-1000.
           Where y1,y2 are top/bottom coordinates and x1,x2 are left/right coordinates.
-          
+
           You are analyzing a TikTok app screenshot to find UI elements.
           If object is found, return box_2d coordinates and descriptive label.
           If object is NOT found, set found=false and explain why in another_response field.
@@ -94,15 +185,14 @@ const findObject = async (taskId: string, deviceId: string, deviceManager: Devic
       ],
       schema: z.object({
         found: z.boolean().describe('Whether the requested object was found'),
-        box_2d: z.array(z.number()).describe('Bounding box coordinates [y1, x1, y2, x2] normalized to 0-1000, required if found=true'),
-        label: z.string().describe('Descriptive label of the found object'),
-        another_response: z.string().describe('Explanation if object not found or additional context').optional(),
+        box_2d: z.array(z.number()).default([]).describe('Bounding box coordinates [y1, x1, y2, x2] normalized to 0-1000, required if found=true, omit/empty if not found'),
+        label: z.string().default('').describe('Descriptive label of the found object, empty if not found'),
+        another_response: z.string().optional().describe('Explanation if object not found or additional context'),
       }),
       schemaName: 'detection_result',
       schemaDescription: 'Object detection result with normalized coordinates',
     });
 
-    const detection = result.object;
     logger.info(`🔍 [Interacting#${taskId}] Detection result:`, detection);
 
     // Process and return structured result
@@ -148,12 +238,14 @@ export async function interactWithScreen<T>(
   finalResultSchema: z.ZodSchema
 ): Promise<T> {
     const interactionTaskId = uuidv4();
-    return new Promise((resolve, reject) => {
-      generateText({
+    let capturedResult: T | undefined;
+    let finished = false;
+
+    await generateText({
         model: llm,
         prompt,
         providerOptions: getThinkingProviderOptions(),
-        stopWhen: [hasToolCall('finish_task'), stepCountIs(20)],
+        stopWhen: [hasToolCall('finish_task'), stepCountIs(AGENT_MAX_STEPS)],
         
         tools: {
           ...deviceManager.getAsAiTools(deviceId),
@@ -165,17 +257,24 @@ export async function interactWithScreen<T>(
               action: z.enum(['answer_question', 'find_object']),
             }),
             execute: async ({ query, action }: { query: string, action: 'answer_question' | 'find_object' }) => {
-              // Adb take screenshot by device id
-              const screenshot = await deviceManager.takeScreenshot(deviceId);
-              if(action === 'answer_question') {
-                const analysisResult = await analyzeScreenshot(interactionTaskId, screenshot, query);
-                return analysisResult;
-              } else if(action === 'find_object') {
-                const findResult = await findObject(interactionTaskId, deviceId, deviceManager, screenshot, query);
-                return findResult;
-              } else {
-                logger.error(`[Interacting#${interactionTaskId}] Invalid action: ${action}`);
-                throw new Error(`Invalid action: ${action}`);
+              try {
+                // Adb take screenshot by device id
+                const screenshot = await deviceManager.takeScreenshot(deviceId);
+                if(action === 'answer_question') {
+                  const analysisResult = await analyzeScreenshot(interactionTaskId, screenshot, query);
+                  return analysisResult;
+                } else if(action === 'find_object') {
+                  const findResult = await findObject(interactionTaskId, deviceId, deviceManager, screenshot, query);
+                  return findResult;
+                } else {
+                  return { error: true, message: `Invalid action: ${action}. Use 'answer_question' or 'find_object'.` };
+                }
+              } catch (error) {
+                // Don't let a single flaky vision call kill the whole stage — let
+                // the agent retry within its step budget instead.
+                const message = error instanceof Error ? error.message : String(error);
+                logger.warn(`[Interacting#${interactionTaskId}] Screenshot analysis failed, agent can retry: ${message}`);
+                return { error: true, found: false, message: `Analysis failed: ${message}. Take a fresh screenshot and try again.` };
               }
             },
           },
@@ -198,7 +297,8 @@ export async function interactWithScreen<T>(
             parameters: finalResultSchema,
             execute: async (finalResult: z.infer<typeof finalResultSchema>) => {
               logger.info(`🏁 [Interacting#${interactionTaskId}] Finished: ${JSON.stringify(finalResult)}`);
-              resolve(finalResult as unknown as T);
+              finished = true;
+              capturedResult = finalResult as unknown as T;
               return 'Ok. We done here. Stop execution, do not continue. Do not take any steps after this.'
             },
           },
@@ -211,7 +311,17 @@ export async function interactWithScreen<T>(
             logger.info(`[Interacting#${interactionTaskId}] Called tool: ${result.toolCalls[0].toolName} -> ${JSON.stringify(result.toolResults[0].result)}`);
           }
         },
-      }).catch(reject);
-    
-    });
+      });
+
+    // generateText resolves when stopWhen is met. If the agent ran out of steps
+    // without calling finish_task, the result was never captured — fail loudly
+    // instead of leaving the caller's promise unsettled (which silently exits
+    // the process with code 13).
+    if (!finished) {
+      throw new Error(
+        `[Interacting#${interactionTaskId}] Agent stopped after ${AGENT_MAX_STEPS} steps without calling finish_task. ` +
+        `Raise AGENT_MAX_STEPS if the task legitimately needs more steps.`,
+      );
+    }
+    return capturedResult as T;
   }

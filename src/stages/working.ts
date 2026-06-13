@@ -45,10 +45,10 @@ function sanitizeTextForADB(text: string): string {
   const original = text;
   
   const sanitized = text
-    // Remove ALL emojis using comprehensive pattern
-    .replace(/[\u{1F000}-\u{1F9FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]|[\u{FE00}-\u{FE0F}]|[\u{1F900}-\u{1F9FF}]|[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]/gu, '')
-    // Remove other problematic unicode characters (keep only ASCII printable)
-    .replace(/[^\x20-\x7E]/g, '')
+    // Drop control characters but KEEP Unicode letters & emoji (e.g. Turkish
+    // ç ş ı ö ü ğ and 🔥👏). ADBKeyboard types them as-is; the adb fallback path
+    // strips non-ASCII in sanitizeForAdbInput, so it never crashes on emoji.
+    .replace(/[\u0000-\u001f\u007f]/g, '')
     // Clean up extra spaces
     .replace(/\s+/g, ' ')
     .trim()
@@ -164,30 +164,30 @@ export class WorkingStage {
       let commentText: string;
       if (this.presets.comments.useAI) {
         try {
+          const { language, maxLength } = this.presets.comments;
           const prompt = `You are an advanced TikTok comment generator. Create natural, engaging comments that match the video's tone and content.
+
+**LANGUAGE: Write the comment in ${language}. Use casual, native-sounding ${language} the way real ${language} speakers comment on TikTok. Do NOT use any other language.**
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
 **Your workflow:**
 1. take_and_analyze_screenshot(query="Analyze this TikTok video content: What's the main subject, mood/tone, and what type of engagement would be most appropriate?", action="answer_question")
-2. Based on the analysis, generate a contextually perfect comment
+2. Based on the analysis, generate a contextually perfect comment in ${language}
 3. finish_task with the comment, confidence, and reasoning
 
 **ADVANCED COMMENT STRATEGY:**
 - Match the video's energy: upbeat video = enthusiastic comment, calm video = thoughtful comment
-- For tutorials/tips: "definitely trying this", "this is so helpful", "good tip"
-- For funny content: "this is hilarious", "so funny", "made my day"
-- For beautiful/aesthetic: "so beautiful", "gorgeous", "amazing view"
-- For dance/music: "love this song", "great moves", "so good"
-- For food: "looks delicious", "want to try this", "yummy"
+- Tailor it to the content type: tutorial/tip, funny, beautiful/aesthetic, dance/music, food, etc.
+- Keep it short and authentic, like a real fan reacting
 
 **STRICT TECHNICAL RULES:**
-- Keep under ${this.presets.comments.maxLength} characters
-- ONLY lowercase letters a-z and spaces
-- NO punctuation, emojis, symbols, or special characters
-- Examples: "this is amazing", "love this energy", "so helpful thanks"
+- Keep under ${maxLength} characters
+- Lowercase; no hashtags or @mentions
+- Add 1-2 fitting emojis where they feel natural — keep it subtle, never spammy
+- Use natural, correct spelling with proper ${language} accents/diacritics (e.g. ç, ş, ı, ö, ü, ğ for Turkish)
 
-**STOP RULE: Always call finish_task with your contextual comment!**`;
+**STOP RULE: Always call finish_task with your contextual comment in ${language}!**`;
           const result = await interactWithScreen<z.infer<typeof CommentGenerationSchema>>(
             prompt,
             this.deviceId,
@@ -203,7 +203,8 @@ export class WorkingStage {
             }];
           }
           const sanitizedComment = sanitizeTextForADB(result.commentText);
-          commentText = sanitizedComment.slice(0, this.presets.comments.maxLength);
+          // Slice by code points so a trailing emoji (surrogate pair) is never cut in half.
+          commentText = [...sanitizedComment].slice(0, this.presets.comments.maxLength).join('');
           logger.info(`🤖 [Working] AI generated comment: "${commentText}" (confidence: ${result.confidence})`);
         } catch (error) {
           const { templates } = this.presets.comments;
@@ -265,61 +266,97 @@ export class WorkingStage {
    */
   async executeComment(commentText: string): Promise<boolean> {
     try {
-      if (!this.learnedUI.commentButton || !this.learnedUI.commentInputField || !this.learnedUI.commentSendButton || !this.learnedUI.commentCloseButton) {
+      // commentCloseButton is no longer required — we close with the back button.
+      if (!this.learnedUI.commentButton || !this.learnedUI.commentInputField || !this.learnedUI.commentSendButton) {
         logger.error(`❌ [Working] Comment UI coordinates not fully learned`);
         return false;
       }
 
-      logger.info(`💬 [Working] Commenting: "${commentText}"`);
-      
+      // Slow phones lag through the comment flow, so wait between every action
+      // to let the UI settle. Tune with COMMENT_STEP_WAIT_S (seconds).
+      const stepWait = Number(process.env.COMMENT_STEP_WAIT_S) || 3;
+
+      logger.info(`💬 [Working] Commenting: "${commentText}" (${stepWait}s between steps)`);
+
       // Step 1: Click comment button
       const { x: commentX, y: commentY } = this.learnedUI.commentButton;
       await this.deviceManager.tapScreen(this.deviceId, commentX, commentY);
-      
-      await this.wait(1, 'After comment button tap');
-      
+      await this.wait(stepWait, 'After comment button tap');
+
+      // Step 1b: Make sure the comment panel actually opened. Some videos have
+      // comments turned off (the comment button is disabled and does nothing),
+      // which would otherwise send the agent looking for an input/send button
+      // that isn't there and loop until the step limit.
+      const panelState = (await this.takeAndAnalyzeScreenshot(
+        `Did the comment section open? If a comment panel/sheet with a text input box to write a comment is now visible, answer exactly OPEN. If comments are turned off/disabled for this video (e.g. a message like "Comments are turned off", or no comment input is available), answer exactly DISABLED.`
+      )).toUpperCase();
+      if (!panelState.includes('OPEN')) {
+        logger.warn(`⚠️ [Working] Comment panel did not open (comments likely disabled); skipping comment for this video`);
+        await this.deviceManager.pressKey(this.deviceId, 'back');
+        await this.wait(stepWait, 'After dismissing closed comment panel');
+        return false;
+      }
+
       // Step 2: Click input field
       const { x: inputX, y: inputY } = this.learnedUI.commentInputField;
       await this.deviceManager.tapScreen(this.deviceId, inputX, inputY);
-      
-      await this.wait(0.5, 'After input field tap');
-      
+      await this.wait(stepWait, 'After input field tap (let keyboard settle)');
+
       // Step 3: Type comment text
       await this.deviceManager.inputText(this.deviceId, commentText);
-      
-      await this.wait(0.5, 'After typing comment');
-      
- 
-      await this.wait(1, 'After comment text verification');
-      
-      // Step 5: Click send button
+      await this.wait(stepWait, 'After typing comment');
+
+      // Confirm the comment actually shows up as a POSTED comment (not just text
+      // sitting in the input box).
+      const verifyPosted = async (): Promise<boolean> => {
+        await this.wait(stepWait, 'Waiting for comment to post');
+        const v = await this.takeAndAnalyzeScreenshot(
+          `Did the comment get POSTED? Look at the posted comments list, NOT the input box. Is "${commentText}" shown as a posted comment in the list? Answer YES only if it appears as a posted comment, otherwise NO.`
+        );
+        return v.toUpperCase().includes('YES');
+      };
+
+      // Step 5a: Submit using the learned send-button coordinate.
       const { x: sendX, y: sendY } = this.learnedUI.commentSendButton;
       await this.deviceManager.tapScreen(this.deviceId, sendX, sendY);
-      
-      await this.wait(2, 'After send button tap');
+      let posted = await verifyPosted();
 
-           // Step 4: Take screenshot to verify text entered
-      const verification = await this.takeAndAnalyzeScreenshot(
-        `Is the text "${commentText}" visible in list of comments, because we sent it? Answer YES if the text is there, NO if not visible.`
-      );
-      
-      if (!verification.toUpperCase().includes('YES')) {
-        logger.warn(`⚠️ [Working] Comment text verification failed: ${verification}`);
-        // Could add retry logic here if needed
-        await this.performHealthCheck();
+      // Step 5b: The send button moves depending on the active keyboard, so if
+      // the saved coordinate missed, locate and tap it visually instead.
+      if (!posted) {
+        logger.warn(`⚠️ [Working] Send via saved coordinate missed; locating the send button visually...`);
+        try {
+          await interactWithScreen(
+            `A comment has already been typed into the TikTok comment input box. Find the SEND / submit button for the comment (usually an arrow or "Post" button at the right end of the comment input row) and tap it with tapScreen to post the comment. Do NOT retype the comment. Then call finish_task.`,
+            this.deviceId,
+            this.deviceManager,
+            {},
+            z.object({ tapped: z.boolean().describe('whether the send button was found and tapped') }),
+          );
+          posted = await verifyPosted();
+        } catch (error) {
+          logger.warn(`⚠️ [Working] Visual send fallback failed:`, error);
+        }
       }
 
+      // Step 6: Close the comment panel with the Android back button — more
+      // reliable than tapping the X, whose position shifts with the keyboard.
+      // Two presses cover the "keyboard up, then panel" case; the long wait
+      // between them means TikTok's double-back-to-exit can never trigger.
+      await this.deviceManager.pressKey(this.deviceId, 'back');
+      await this.wait(stepWait, 'After back (close keyboard/panel)');
+      await this.deviceManager.pressKey(this.deviceId, 'back');
+      await this.wait(stepWait, 'After back (close comment panel)');
 
-      this.stats.commentsPosted++;
-      
-      // Step 6: Close comment interface
-      const { x: closeX, y: closeY } = this.learnedUI.commentCloseButton;
-      await this.deviceManager.tapScreen(this.deviceId, closeX, closeY);
-      
-      await this.wait(1, 'After closing comment interface');
-      
-      logger.info(`✅ [Working] Comment posted and interface closed successfully`);
-      return true;
+      if (posted) {
+        this.stats.commentsPosted++;
+        logger.info(`✅ [Working] Comment posted: "${commentText}"`);
+        return true;
+      }
+
+      logger.error(`❌ [Working] Comment could NOT be confirmed as posted: "${commentText}"`);
+      await this.performHealthCheck();
+      return false;
       
     } catch (error) {
       logger.error(`❌ [Working] Comment action failed:`, error);

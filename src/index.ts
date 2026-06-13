@@ -55,6 +55,12 @@ class TikTokBot {
       // 2. Create and start workers for each device
       await this.createWorkers(devices);
 
+      // 2b. Switch each device to ADBKeyboard for reliable comment typing.
+      // The original keyboard is restored on shutdown (see shutdown()).
+      for (const deviceId of this.workers.keys()) {
+        await this.deviceManager.enableAdbKeyboard(deviceId);
+      }
+
       // 3. Start agent managers for each worker
       await this.startAgentManagers();
 
@@ -289,6 +295,12 @@ class TikTokBot {
     logger.info('🔄 Shutting down TikTok Agent Bot...');
 
     try {
+      // Restore each device's original keyboard (we switched it to ADBKeyboard
+      // at startup). Do this first, while adb is still responsive.
+      for (const deviceId of this.workers.keys()) {
+        await this.deviceManager.restoreOriginalKeyboard(deviceId);
+      }
+
       // Stop all agent managers
       const agentStopPromises = Array.from(this.agentManagers.values()).map(
         async agent => agent.stop().catch(err => logger.error('Error stopping agent:', err))

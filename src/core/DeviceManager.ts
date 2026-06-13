@@ -4,7 +4,7 @@ import type { ToolSet } from 'ai';
 import { z } from 'zod';
 
 
-import { execAsync, logger } from '../tools/utils.js';
+import { execAsync, logger, transliterateToAscii } from '../tools/utils.js';
 /**
  * Android device information
  */
@@ -589,40 +589,152 @@ export class DeviceManager {
   }
 
   /**
-   * Input text at current focus
-   * Note: Complex characters may need special handling
+   * Reduce a string to characters `adb shell input text` can safely type.
+   *
+   * Android's `input text` cannot type emoji / non-ASCII (the surrogate halves
+   * get mangled and the command fails), and any unescaped shell metacharacter
+   * in this LLM-controlled value would otherwise run on the host. So we keep a
+   * conservative allowlist: letters, digits, space and basic punctuation.
    */
-  async inputText(deviceId: string, text: string): Promise<string> {
+  private sanitizeForAdbInput(text: string): string {
+    return transliterateToAscii(text)
+      .replace(/[^A-Za-z0-9 .,!?'-]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Original IME per device, saved before switching to ADBKeyboard. */
+  private previousImeByDevice = new Map<string, string>();
+
+  /** Whether ADBKeyboard (com.android.adbkeyboard) is the active IME. */
+  private async isAdbKeyboardActive(deviceId: string): Promise<boolean> {
     try {
-      // Method 1: Standard text input (most reliable for basic text)
-      const escapedText = text.replace(/[" ]/g, (match) => {
-        if (match === ' ') return '%s';
-        return '\\"';
-      });
-      
-      try {
-        await execAsync(`adb -s ${deviceId} shell input text "${escapedText}"`);
-        logger.info(`⌨️ [DeviceManager] Input text "${text}" on ${deviceId}`);
-        return `Successfully input text: '${text}'`;
-      } catch (error) {
-        logger.warn(`Standard text input failed, trying fallback method: ${error}`);
+      const { stdout } = await execAsync(
+        `adb -s ${deviceId} shell settings get secure default_input_method`,
+      );
+      return stdout.includes('com.android.adbkeyboard');
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Switch the device to ADBKeyboard for reliable text entry, remembering the
+   * current keyboard so it can be restored later. Returns false (and leaves the
+   * keyboard untouched) if ADBKeyboard isn't installed, so the caller falls back
+   * to char-by-char `input text`.
+   */
+  async enableAdbKeyboard(deviceId: string): Promise<boolean> {
+    try {
+      const { stdout: pkgs } = await execAsync(
+        `adb -s ${deviceId} shell pm list packages com.android.adbkeyboard`,
+      );
+      if (!pkgs.includes('com.android.adbkeyboard')) {
+        logger.warn(`⚠️ [DeviceManager] ADBKeyboard not installed on ${deviceId}; using char-by-char input fallback`);
+        return false;
       }
 
-      // Method 2: Character-by-character input (fallback for special chars)
-      for (let i = 0; i < text.length; i++) {
-        const char = text[i];
+      const { stdout } = await execAsync(
+        `adb -s ${deviceId} shell settings get secure default_input_method`,
+      );
+      const current = stdout.trim();
+      if (current && !current.includes('adbkeyboard')) {
+        this.previousImeByDevice.set(deviceId, current);
+      } else if (!this.previousImeByDevice.has(deviceId)) {
+        // Already on ADBKeyboard (e.g. a previous run was killed before it could
+        // restore). We don't know the user's real keyboard, so fall back to the
+        // first other enabled IME so we never strand the phone on ADBKeyboard.
+        try {
+          const { stdout: imes } = await execAsync(`adb -s ${deviceId} shell ime list -s`);
+          const other = imes.split(/\s+/).map((s) => s.trim()).find((s) => s.includes('/') && !s.includes('adbkeyboard'));
+          if (other) this.previousImeByDevice.set(deviceId, other);
+        } catch {
+          // best-effort; restore will simply no-op if we couldn't find one
+        }
+      }
+
+      await execAsync(`adb -s ${deviceId} shell ime enable com.android.adbkeyboard/.AdbIME`);
+      await execAsync(`adb -s ${deviceId} shell ime set com.android.adbkeyboard/.AdbIME`);
+      logger.info(`⌨️ [DeviceManager] ${deviceId} switched to ADBKeyboard (original "${current}" will be restored on shutdown)`);
+      return true;
+    } catch (error) {
+      logger.warn(`⚠️ [DeviceManager] Could not enable ADBKeyboard on ${deviceId}: ${error}`);
+      return false;
+    }
+  }
+
+  /** Restore the keyboard that was active before {@link enableAdbKeyboard}. */
+  async restoreOriginalKeyboard(deviceId: string): Promise<void> {
+    const previous = this.previousImeByDevice.get(deviceId);
+    if (!previous) return;
+    try {
+      await execAsync(`adb -s ${deviceId} shell ime set ${previous}`);
+      logger.info(`⌨️ [DeviceManager] Restored original keyboard on ${deviceId}: ${previous}`);
+    } catch (error) {
+      logger.warn(`⚠️ [DeviceManager] Could not restore keyboard on ${deviceId}: ${error}`);
+    } finally {
+      this.previousImeByDevice.delete(deviceId);
+    }
+  }
+
+  /**
+   * Input text at current focus.
+   *
+   * Preferred path: if the ADBKeyboard IME is active, the whole string is
+   * committed in one broadcast via the input connection — reliable on slow
+   * devices and apps like TikTok where `input text` event injection drops most
+   * characters (often only the first one lands). Base64 is used so spaces /
+   * punctuation never reach the shell unescaped.
+   *
+   * ADBKeyboard preserves full Unicode (e.g. Turkish ç/ş/ı), so the comment is
+   * typed exactly as written. The base64-encoded payload also means spaces and
+   * punctuation never reach the shell unescaped.
+   *
+   * Fallback (no ADBKeyboard): character-by-character `input text`, which is
+   * unreliable for long strings on old devices but needs no setup. Emoji /
+   * non-ASCII are transliterated to ASCII for this path; see
+   * {@link sanitizeForAdbInput}.
+   */
+  async inputText(deviceId: string, text: string): Promise<string> {
+    if (await this.isAdbKeyboardActive(deviceId)) {
+      // ADBKeyboard handles any Unicode, so keep diacritics; just drop control
+      // characters and collapse whitespace.
+      const unicodeText = text.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (unicodeText.length === 0) {
+        logger.warn(`⚠️ [DeviceManager] inputText skipped — empty text on ${deviceId}`);
+        return `Skipped input: empty text`;
+      }
+      const b64 = Buffer.from(unicodeText, 'utf-8').toString('base64');
+      await execAsync(`adb -s ${deviceId} shell am broadcast -a ADB_INPUT_B64 --es msg "${b64}"`);
+      logger.info(`⌨️ [DeviceManager] Input text "${unicodeText}" via ADBKeyboard on ${deviceId}`);
+      return `Successfully input text: '${unicodeText}'`;
+    }
+
+    const sanitized = this.sanitizeForAdbInput(text);
+    if (sanitized.length === 0) {
+      logger.warn(`⚠️ [DeviceManager] inputText skipped — no typeable characters in "${text}" on ${deviceId}`);
+      return `Skipped input: no typeable characters in '${text}'`;
+    }
+
+    // `adb shell input text "<whole string>"` injects keystrokes faster than a
+    // slow device's IME can absorb, so characters get dropped (often only the
+    // first 1-2 register). Type character-by-character with a delay so every
+    // keystroke lands. Tune the delay with ADB_INPUT_CHAR_DELAY_MS (raise it for
+    // older/slower phones, lower it for speed on fast devices).
+    const charDelayMs = Number(process.env.ADB_INPUT_CHAR_DELAY_MS) || 120;
+
+    try {
+      for (const char of sanitized) {
         if (char === ' ') {
           await execAsync(`adb -s ${deviceId} shell input keyevent 62`); // Space keycode
         } else {
-          const escapedChar = char.replace(/"/g, '\\"');
-          await execAsync(`adb -s ${deviceId} shell input text "${escapedChar}"`);
+          await execAsync(`adb -s ${deviceId} shell input text "${char}"`);
         }
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise(resolve => setTimeout(resolve, charDelayMs));
       }
 
-      logger.info(`⌨️ [DeviceManager] Input text (char-by-char) "${text}" on ${deviceId}`);
-      return `Successfully input text (character-by-character): '${text}'`;
-
+      logger.info(`⌨️ [DeviceManager] Input text "${sanitized}" on ${deviceId} (${sanitized.length} chars @ ${charDelayMs}ms/char)`);
+      return `Successfully input text: '${sanitized}'`;
     } catch (error) {
       logger.error(`❌ Failed to input text "${text}" on ${deviceId}:`, error);
       throw new Error(`Failed to input text: ${error}`);

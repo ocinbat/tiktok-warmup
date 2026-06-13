@@ -183,6 +183,25 @@ export const sanitizeDeviceId = (deviceId: string): string => {
 };
 
 /**
+ * Map accented / non-ASCII letters to their closest ASCII equivalent so text
+ * survives `adb shell input text` (which can't type Unicode without a custom
+ * keyboard). Turkish letters are handled explicitly because NFKD does not
+ * decompose ı/İ. Diacritic-free output ("çok güzel" -> "cok guzel") still reads
+ * naturally — it's how most casual Turkish TikTok comments are written.
+ */
+export const transliterateToAscii = (text: string): string => {
+  const map: Record<string, string> = {
+    ç: 'c', Ç: 'C', ğ: 'g', Ğ: 'G', ı: 'i', İ: 'I',
+    ö: 'o', Ö: 'O', ş: 's', Ş: 'S', ü: 'u', Ü: 'U',
+  };
+  return text
+    .replace(/[çÇğĞıİöÖşŞüÜ]/g, (ch) => map[ch] ?? ch)
+    // Decompose any remaining accents (é, ñ, …) and drop the combining marks.
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '');
+};
+
+/**
  * Check if string is valid JSON
  */
 export const isValidJson = (str: string): boolean => {

@@ -19,6 +19,7 @@ export interface AutomationPresets {
   };
   
   comments: {
+    language: string;       // language to write comments in (e.g. "English", "Turkish")
     templates: string[];
     useAI: boolean;
     maxLength: number;
@@ -34,6 +35,31 @@ export interface AutomationPresets {
 }
 
 /**
+ * Comment language — set with the COMMENT_LANGUAGE env var (default English).
+ * The AI generator writes comments in this language; templates below are the
+ * offline fallback for the same language.
+ */
+const COMMENT_LANGUAGE = process.env.COMMENT_LANGUAGE?.trim() || 'English';
+
+/**
+ * Offline fallback templates per language (used when AI generation is off or
+ * fails). Kept ASCII / diacritic-free so they type cleanly over adb.
+ */
+const COMMENT_TEMPLATES: Record<string, string[]> = {
+  English: [
+    'amazing', 'love this content', 'so cool', 'great video', 'nice',
+    'this is fire', 'cant stop watching', 'so good', 'perfect', 'love it',
+    'this hits different', 'absolutely love this', 'so talented', 'incredible',
+    'this is everything',
+  ],
+  Turkish: [
+    'harika 🔥', 'bayıldım 😍', 'çok güzel', 'muhteşem video 👏', 'eline sağlık',
+    'süpersin', 'bu çok iyi', 'mükemmel 👌', 'kesinlikle takip', 'efsane 🔥',
+    'çok başarılı', 'helal', 'izlemeye doyamadım', 'valla güzelmiş', 'çok tatlı 🥰',
+  ],
+};
+
+/**
  * Default automation settings
  */
 export const AUTOMATION_PRESETS: AutomationPresets = {
@@ -47,29 +73,14 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
   },
   
   interactions: {
-    likeChance: 0.7,          // Like 70% of videos
-    commentChance: 0.5,       // Comment on 10% of videos
+    likeChance: 0.0167,       // Like ~1 in 60 videos (statistical, per-video probability)
+    commentChance: 0.005,     // Comment ~1 in 200 videos (statistical, per-video probability)
     dailyLimit: 500,          // Max 500 actions per day
   },
   
   comments: {
-    templates: [
-      "amazing",
-      "love this content",
-      "so cool",
-      "great video",
-      "nice",
-      "this is fire",
-      "cant stop watching",
-      "so good",
-      "perfect",
-      "love it",
-      "this hits different",
-      "absolutely love this",
-      "so talented",
-      "incredible",
-      "this is everything",
-    ],
+    language: COMMENT_LANGUAGE,
+    templates: COMMENT_TEMPLATES[COMMENT_LANGUAGE] ?? COMMENT_TEMPLATES.English,
     useAI: true,
     maxLength: 50,
   },
