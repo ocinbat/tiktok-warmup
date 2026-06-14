@@ -2,9 +2,11 @@
  * Automation presets and configuration
  */
 
+import { type AppProfile, getAppProfile } from './apps.js';
+
 export interface AutomationPresets {
-  tiktokAppPackage: string;
-  tiktokLoadTime: number;
+  /** Which social app this run drives (package, feed name, navigation hints). */
+  app: AppProfile;
   video: {
     watchDuration: [number, number]; // [min, max] seconds for normal viewing
     quickSkipChance: number;         // 0-1 probability to skip after 1 second
@@ -63,8 +65,8 @@ const COMMENT_TEMPLATES: Record<string, string[]> = {
  * Default automation settings
  */
 export const AUTOMATION_PRESETS: AutomationPresets = {
-  tiktokAppPackage: 'com.zhiliaoapp.musically',
-  tiktokLoadTime: 3,
+  // Default app; overridden per-run from the --app flag in index.ts.
+  app: getAppProfile('tiktok'),
   video: {
     watchDuration: [5, 10],   // Watch 5-10 seconds normally
     quickSkipChance: 0.2,     // Skip quickly on 20% of videos (1 in 5)
@@ -86,7 +88,7 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
   },
   
   control: {
-    healthCheckInterval: 100, // Every 100 videos check screen if it is healthy and looks like TikTok feed
+    healthCheckInterval: 100, // Every 100 videos check screen if it is healthy and looks like the app's video feed
     maxHealthFailures: 3, // Max 3 health check failures before retraining UI coordinates
     shadowBanInterval: 200, // Every 200 videos check if the account is shadow banned
     maxConsecutiveErrors: 5, // Max 5 consecutive errors before stopping

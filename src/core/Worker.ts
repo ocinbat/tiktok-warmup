@@ -97,7 +97,7 @@ export class Worker {
       
       // Load saved UI data if available
       logger.info(`📄 Loading saved UI data for ${this.deviceId}...`);
-      const savedUIData = await UIDataPersistence.loadDeviceUIData(this.deviceId);
+      const savedUIData = await UIDataPersistence.loadDeviceUIData(this.deviceId, this.presets.app.id);
       if (savedUIData) {
         this.learnedUI = savedUIData;
         logger.info(`✅ Loaded saved UI data for ${this.deviceName}:`, savedUIData);
@@ -126,9 +126,9 @@ export class Worker {
     this.currentStage = 'learning';
 
     try {
-      const result = await runLearningStage(this.deviceId, this.deviceManager);
-      
-      if (result.success && result.tiktokLaunched) {
+      const result = await runLearningStage(this.deviceId, this.deviceManager, this.presets.app);
+
+      if (result.success && result.appLaunched) {
         // Store learned UI coordinates
         const { uiElementsFound } = result;
         
@@ -184,7 +184,7 @@ export class Worker {
 
         // Save learned UI data for future use
         try {
-          await UIDataPersistence.saveDeviceUIData(this.deviceId, this.deviceName, this.learnedUI);
+          await UIDataPersistence.saveDeviceUIData(this.deviceId, this.deviceName, this.presets.app.id, this.learnedUI);
         } catch (error) {
           logger.warn(`⚠️ Failed to save UI data for ${this.deviceName}:`, error);
         }
@@ -302,19 +302,17 @@ export class Worker {
    * Check if worker has completed learning stage
    */
   hasLearnedUI(): boolean {
-    const hasBasicUI = !!(
-      this.learnedUI.likeButton && 
-      this.learnedUI.commentButton && 
-      this.learnedUI.commentInputField && 
+    // commentCloseButton is intentionally NOT required: the working stage closes
+    // the comment panel with the Android back button, and many apps' comment
+    // panels have no visible X button to learn. Requiring it forced needless
+    // re-learning and made the learning agent loop hunting for a button that
+    // does not exist.
+    return !!(
+      this.learnedUI.likeButton &&
+      this.learnedUI.commentButton &&
+      this.learnedUI.commentInputField &&
       this.learnedUI.commentSendButton
     );
-    
-    // Check if commentCloseButton exists
-    if (!this.learnedUI.commentCloseButton) {
-      return false;
-    }
-    
-    return hasBasicUI && !!this.learnedUI.commentCloseButton;
   }
 
   /**
@@ -357,17 +355,17 @@ export class Worker {
    * Run Initiating Stage - Launch TikTok and ensure readiness
    */
   async runInitiatingStage(): Promise<boolean> {
+    const { app } = this.presets;
     this.currentStage = 'initiating';
-    logger.info(`🚀 [Worker] Initiating stage: launching TikTok on ${this.deviceName}`);
+    logger.info(`🚀 [Worker] Initiating stage: launching ${app.displayName} on ${this.deviceName}`);
     try {
-      // Launch TikTok
-      await this.deviceManager.launchApp(this.deviceId, this.presets.tiktokAppPackage);
-      logger.info(`⏳ [Worker] Waiting ${this.presets.tiktokLoadTime}s for TikTok to load`);
-      await new Promise(res => setTimeout(res, this.presets.tiktokLoadTime * 1000));
+      await this.deviceManager.launchApp(this.deviceId, app.appPackage);
+      logger.info(`⏳ [Worker] Waiting ${app.loadTime}s for ${app.displayName} to load`);
+      await new Promise(res => setTimeout(res, app.loadTime * 1000));
       logger.info(`✅ [Worker] Initiating complete for ${this.deviceName}`);
       return true;
     } catch (error) {
-      logger.error(`❌ [Worker] Failed to launch TikTok on ${this.deviceName}:`, error);
+      logger.error(`❌ [Worker] Failed to launch ${app.displayName} on ${this.deviceName}:`, error);
       return false;
     }
   }
@@ -383,11 +381,12 @@ export class Worker {
       if (!this.isInitialized) {
         await this.initialize();
       }
-      // Step 2: Initiating stage (launch TikTok)
+      // Step 2: Initiating stage (launch the app)
       logger.info(`🚀 Starting initiating stage for ${this.deviceName}...`);
       const initSuccess = await this.runInitiatingStage();
       if (!initSuccess) {
-        throw new Error('Initiating stage failed: unable to launch TikTok or wait for it to load. Ensure USB debugging is authorized and TikTok is installed.');
+        const appName = this.presets.app.displayName;
+        throw new Error(`Initiating stage failed: unable to launch ${appName} or wait for it to load. Ensure USB debugging is authorized and ${appName} is installed.`);
       }
 
       // Step 2: Learning Stage (skip if we have valid saved data)

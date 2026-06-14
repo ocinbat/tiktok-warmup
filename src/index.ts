@@ -3,7 +3,8 @@
 import { pathToFileURL } from 'node:url';
 
 import 'dotenv/config';
-import { AUTOMATION_PRESETS } from './config/presets.js';
+import { type AppId, getAppProfile, isAppId } from './config/apps.js';
+import { type AutomationPresets, AUTOMATION_PRESETS } from './config/presets.js';
 import { AgentManager } from './core/AgentManager.js';
 import { DeviceManager } from './core/DeviceManager.js';
 import { Worker } from './core/Worker.js';
@@ -23,6 +24,7 @@ interface TikTokBotConfig {
   maxDevices?: number;
   targetDevice?: string;
   debug?: boolean;
+  app?: AppId;
 }
 
 class TikTokBot {
@@ -30,8 +32,11 @@ class TikTokBot {
   private agentManagers: Map<string, AgentManager> = new Map();
   private workers: Map<string, Worker> = new Map();
   private isShuttingDown = false;
+  private presets: AutomationPresets;
 
   constructor(private config: TikTokBotConfig = {}) {
+    // Build per-run presets for the selected app (defaults to TikTok).
+    this.presets = { ...AUTOMATION_PRESETS, app: getAppProfile(config.app) };
     this.deviceManager = new DeviceManager();
     this.setupSignalHandlers();
   }
@@ -42,8 +47,8 @@ class TikTokBot {
    */
   async start(): Promise<void> {
     try {
-      logger.info('🚀 Starting TikTok Agent Bot...');
-      
+      logger.info(`🚀 Starting Social Agent Bot for ${this.presets.app.displayName}...`);
+
       // 1. Discover available Android devices
       const devices = await this.discoverDevices();
       
@@ -112,11 +117,11 @@ class TikTokBot {
         const worker = new Worker({
           deviceId: device.id,
           deviceName: device.name,
-          presets: AUTOMATION_PRESETS,
+          presets: this.presets,
           deviceManager: this.deviceManager,
         });
 
-        logger.info(`🔧 Loaded presets: ${JSON.stringify(AUTOMATION_PRESETS)}`);
+        logger.info(`🔧 Loaded presets: ${JSON.stringify(this.presets)}`);
 
         await worker.initialize();
         this.workers.set(device.id, worker);
@@ -294,7 +299,7 @@ class TikTokBot {
     if (this.isShuttingDown) return;
     
     this.isShuttingDown = true;
-    logger.info('🔄 Shutting down TikTok Agent Bot...');
+    logger.info('🔄 Shutting down Social Agent Bot...');
 
     try {
       // Restore each device's original keyboard (we switched it to ADBKeyboard
@@ -340,24 +345,36 @@ async function main() {
         config.maxDevices = parseInt(args[i + 1]);
         i++;
         break;
+      case '--app': {
+        const requested = args[i + 1];
+        if (!isAppId(requested)) {
+          console.error(`❌ Invalid --app value: "${requested ?? ''}". Supported: tiktok, instagram`);
+          process.exit(1);
+        }
+        config.app = requested;
+        i++;
+        break;
+      }
       case '--debug':
         config.debug = true;
         break;
       case '--help':
         console.log(`
-TikTok Agent Bot - Multi-Device Automation
+Social Agent Bot - Multi-Device Automation (TikTok / Instagram)
 
 Usage: pnpm start [options]
 
 Options:
+  --app <name>          App to drive: tiktok (default) or instagram
   --device <id>         Target specific device ID
   --max-devices <num>   Maximum number of devices to use
   --debug              Enable debug logging
   --help               Show this help message
 
 Examples:
-  pnpm start                    # Use all connected devices
-  pnpm start --device emulator-5554
+  pnpm start                          # TikTok on all connected devices
+  pnpm start --app instagram          # Instagram (Reels) on all devices
+  pnpm start --app tiktok --device emulator-5554
   pnpm start --max-devices 2
         `);
         process.exit(0);

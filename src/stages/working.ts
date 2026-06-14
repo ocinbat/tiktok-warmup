@@ -32,7 +32,7 @@ export const ActionDecisionSchema = z.object({
  * Comment Generation Schema
  */
 export const CommentGenerationSchema = z.object({
-  screenLooksLikeNormalTikTokFeed: z.boolean().describe('Whether the screen looks like a normal TikTok feed? Not a shop, popup, etc.'),
+  screenLooksLikeNormalFeed: z.boolean().describe('Whether the screen looks like a normal video feed? Not a shop, popup, profile page, etc.'),
   commentText: z.string().describe('The generated comment text, natural and engaging'),
   confidence: z.string().describe('Confidence level: high/medium/low'),
   reasoning: z.string().describe('Why this comment fits the video content'),
@@ -98,7 +98,7 @@ export class WorkingStage {
   async takeAndAnalyzeScreenshot(query: string): Promise<string> {
     logger.debug(`📸 [Working] Taking screenshot for analysis: ${query}`);
     
-    const prompt = `You are a visual analysis assistant for TikTok automation. Analyze the screenshot and answer the specific question.
+    const prompt = `You are a visual analysis assistant for ${this.presets.app.displayName} automation. Analyze the screenshot and answer the specific question.
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
@@ -165,14 +165,15 @@ export class WorkingStage {
       if (this.presets.comments.useAI) {
         try {
           const { language, maxLength } = this.presets.comments;
-          const prompt = `You are an advanced TikTok comment generator. Create natural, engaging comments that match the video's tone and content.
+          const appName = this.presets.app.displayName;
+          const prompt = `You are an advanced ${appName} comment generator. Create natural, engaging comments that match the video's tone and content.
 
-**LANGUAGE: Write the comment in ${language}. Use casual, native-sounding ${language} the way real ${language} speakers comment on TikTok. Do NOT use any other language.**
+**LANGUAGE: Write the comment in ${language}. Use casual, native-sounding ${language} the way real ${language} speakers comment on ${appName}. Do NOT use any other language.**
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
 **Your workflow:**
-1. take_and_analyze_screenshot(query="Analyze this TikTok video content: What's the main subject, mood/tone, and what type of engagement would be most appropriate?", action="answer_question")
+1. take_and_analyze_screenshot(query="Analyze this ${appName} video content: What's the main subject, mood/tone, and what type of engagement would be most appropriate?", action="answer_question")
 2. Based on the analysis, generate a contextually perfect comment in ${language}
 3. finish_task with the comment, confidence, and reasoning
 
@@ -195,11 +196,11 @@ export class WorkingStage {
             {},
             CommentGenerationSchema
           );
-          if(!result.screenLooksLikeNormalTikTokFeed) {
-            logger.warn(`⚠️ [Working] AI generated comment is not for a normal TikTok feed, skipping`);
+          if(!result.screenLooksLikeNormalFeed) {
+            logger.warn(`⚠️ [Working] AI generated comment is not for a normal ${this.presets.app.feedName}, skipping`);
             return [{
               action: 'next_video',
-              reason: `AI generated comment is not for a normal TikTok feed, skipping`,
+              reason: `AI generated comment is not for a normal ${this.presets.app.feedName}, skipping`,
             }];
           }
           const sanitizedComment = sanitizeTextForADB(result.commentText);
@@ -327,7 +328,7 @@ export class WorkingStage {
         logger.warn(`⚠️ [Working] Send via saved coordinate missed; locating the send button visually...`);
         try {
           await interactWithScreen(
-            `A comment has already been typed into the TikTok comment input box. Find the SEND / submit button for the comment (usually an arrow or "Post" button at the right end of the comment input row) and tap it with tapScreen to post the comment. Do NOT retype the comment. Then call finish_task.`,
+            `A comment has already been typed into the ${this.presets.app.displayName} comment input box. Find the SEND / submit button for the comment (usually an arrow or "Post" button at the right end of the comment input row) and tap it with tapScreen to post the comment. Do NOT retype the comment. Then call finish_task.`,
             this.deviceId,
             this.deviceManager,
             {},
@@ -499,18 +500,19 @@ export class WorkingStage {
   }
 
   /**
-   * Perform health check every 10th video to ensure we're still on normal TikTok
+   * Perform a periodic health check to ensure we're still on the normal video feed
    */
   async performHealthCheck(): Promise<boolean> {
     logger.info(`🩺 [Working] Running health check...`);
-    
-    const prompt = `You are a TikTok automation health checker. Your mission is to verify we're still on normal TikTok and fix any issues.
+
+    const { app } = this.presets;
+    const prompt = `You are a ${app.displayName} automation health checker. Your mission is to verify we're still on the normal ${app.displayName} ${app.feedName} and fix any issues.
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP (max 6 steps total)!**
 
 **STEP-BY-STEP FLOW:**
-1. take_and_analyze_screenshot(query="Check if this is normal TikTok video feed with like/comment buttons visible", action="answer_question")
-2. IF normal TikTok -> finish_task(success=true, currentState="Normal TikTok", problemsDetected=[], actionsPerformed=[], message="All good")
+1. take_and_analyze_screenshot(query="Check if this is the normal ${app.displayName} ${app.feedName} (full-screen vertical video) with like/comment buttons visible", action="answer_question")
+2. IF normal ${app.feedName} -> finish_task(success=true, currentState="Normal ${app.feedName}", problemsDetected=[], actionsPerformed=[], message="All good")
 3. IF problems detected -> try to fix them using available tools
 4. After attempting fixes -> take another screenshot to verify
 5. finish_task with final result
@@ -519,13 +521,13 @@ export class WorkingStage {
 - Login screens → use interact_with_screen to close or go back
 - Ad overlays → find X button and tap it
 - Update prompts → dismiss with "Later" or X
-- Wrong tab → tap "For You" tab
+- Wrong screen / not on the video feed → navigate back to the ${app.feedName}${app.feedNavigationHint ? ` (${app.feedNavigationHint})` : ''}
 - Popups → find close button
-- App crashed → launch_app_activity(package_name="${this.presets.tiktokAppPackage}")
+- App crashed → launch_app_activity(package_name="${app.appPackage}")
 
-If you see - "Find related content", some user profile or any other strange UI not related to normal TikTok video feed - it means that you are stuck. Just restart the app.
+If you see a profile page, a shop, "Find related content", or any other UI that is not the normal ${app.feedName} - it means you are stuck. Navigate back to the feed or restart the app.
 
-If something goes wrong, good solution - it to terminate and launch app again.
+If something goes wrong, a good solution is to terminate and launch the app again.
 
 Before finishing the task, make sure to take a screenshot of the screen and analyze it to confirm that the problems are fixed/solved.
 
@@ -580,31 +582,32 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
   }
 
   /**
-   * Ensure TikTok is ready using the same pattern as learning stage
+   * Ensure the app's video feed is ready using the same pattern as learning stage
    */
-  async ensureTikTokReady(): Promise<boolean> {
-    logger.info(`🔍 [Working] Ensuring TikTok is ready...`);
-    
-    const prompt = `You are a TikTok automation agent ensuring the app is ready before starting work.
+  async ensureAppReady(): Promise<boolean> {
+    const { app } = this.presets;
+    logger.info(`🔍 [Working] Ensuring ${app.displayName} is ready...`);
+
+    const prompt = `You are a ${app.displayName} automation agent ensuring the app's ${app.feedName} is ready before starting work.
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
 **Your mission (maximum 3-4 steps):**
 1. Take screenshot to check current state
-2. If TikTok already visible -> call finish_task immediately with success:true
-3. If TikTok not running -> launch it, wait, verify, then finish_task
-If something is wrong, try to fix it, if you can't, call finish_task with success:false
+2. If the ${app.displayName} ${app.feedName} is already visible -> call finish_task immediately with success:true
+3. If ${app.displayName} is not running -> launch it, wait, verify, then finish_task
+${app.feedNavigationHint ? `4. ${app.feedNavigationHint}\n` : ''}If something is wrong, try to fix it, if you can't, call finish_task with success:false
 You can tap, swipe, scroll, etc.
 
 **STEP-BY-STEP FLOW:**
-1. take_and_analyze_screenshot(query="Is the TikTok app currently open and is the main video feed visible?", action="answer_question")
-2. IF result shows TikTok ready -> finish_task(success=true, message="TikTok is already running")
-3. IF TikTok not ready -> launch_app_activity(package_name="${this.presets.tiktokAppPackage}")
-4. wait_for_ui(seconds=5, reason="Wait for TikTok to load after launching")
-5. take_and_analyze_screenshot to verify
+1. take_and_analyze_screenshot(query="Is the ${app.displayName} app open and is the ${app.feedName} (full-screen vertical video) visible?", action="answer_question")
+2. IF result shows the ${app.feedName} ready -> finish_task(success=true, message="${app.displayName} is already running")
+3. IF not ready -> launch_app_activity(package_name="${app.appPackage}")
+4. wait_for_ui(seconds=5, reason="Wait for ${app.displayName} to load after launching")
+5. ${app.feedNavigationHint ? 'Navigate to the video feed as described above, then ' : ''}take_and_analyze_screenshot to verify
 6. finish_task with final result
 
-**STOP RULE: Call finish_task when TikTok is confirmed ready or if after 10 attempts you can't fix it!**`;
+**STOP RULE: Call finish_task when the ${app.feedName} is confirmed ready or if after 10 attempts you can't fix it!**`;
 
     const ResultSchema = z.object({
       success: z.boolean(),
@@ -613,22 +616,22 @@ You can tap, swipe, scroll, etc.
 
     try {
       const result = await interactWithScreen<z.infer<typeof ResultSchema>>(
-        prompt, 
-        this.deviceId, 
-        this.deviceManager, 
-        {}, 
+        prompt,
+        this.deviceId,
+        this.deviceManager,
+        {},
         ResultSchema
       );
-      
+
       if (result.success) {
-        logger.info(`✅ [Working] TikTok is ready: ${result.message}`);
+        logger.info(`✅ [Working] ${app.displayName} is ready: ${result.message}`);
       } else {
-        logger.error(`❌ [Working] TikTok not ready: ${result.message}`);
+        logger.error(`❌ [Working] ${app.displayName} not ready: ${result.message}`);
       }
-      
+
       return result.success;
     } catch (error) {
-      logger.error(`❌ [Working] Error ensuring TikTok ready:`, error);
+      logger.error(`❌ [Working] Error ensuring ${app.displayName} ready:`, error);
       return false;
     }
   }
@@ -707,16 +710,16 @@ Check if the like button appears active/highlighted (usually red heart) which wo
   async execute(): Promise<z.infer<typeof WorkingResultSchema>> {
     logger.info(`🚀 [Working] Starting automation loop for device: ${this.deviceId}`);
     
-    // Step 0: Ensure TikTok is ready before automation
-    const tiktokReady = await this.ensureTikTokReady();
-    if (!tiktokReady) {
+    // Step 0: Ensure the app's video feed is ready before automation
+    const appReady = await this.ensureAppReady();
+    if (!appReady) {
       return {
         success: false,
         videosWatched: 0,
         likesGiven: 0,
         commentsPosted: 0,
         shouldContinue: false,
-        message: 'Failed to ensure TikTok is ready for automation',
+        message: `Failed to ensure ${this.presets.app.displayName} is ready for automation`,
       };
     }
     

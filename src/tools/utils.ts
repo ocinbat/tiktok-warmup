@@ -21,7 +21,7 @@ export enum LogLevel {
  */
 class Logger {
   private level: LogLevel = LogLevel.INFO;
-  private prefix = '[TikTok-Agent]';
+  private prefix = '[Social-Agent]';
 
   constructor() {
     // Set log level from environment

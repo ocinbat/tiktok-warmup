@@ -11,6 +11,7 @@ import type { LearnedUIElements } from './Worker.js';
 interface StoredUIData {
   deviceId: string;
   deviceName: string;
+  appId: string;
   learnedUI: LearnedUIElements;
   timestamp: number;
   version: string;
@@ -83,29 +84,39 @@ export class UIDataPersistence {
   }
 
   /**
-   * Load learned UI data for specific device
+   * Storage key — scoped per device AND per app, because each app's UI layout
+   * (button coordinates) is different. Sharing a key across apps would reuse the
+   * wrong coordinates after switching --app on the same device.
    */
-  static async loadDeviceUIData(deviceId: string): Promise<LearnedUIElements | null> {
+  private static storageKey(deviceId: string, appId: string): string {
+    return `${deviceId}::${appId}`;
+  }
+
+  /**
+   * Load learned UI data for a specific device + app
+   */
+  static async loadDeviceUIData(deviceId: string, appId: string): Promise<LearnedUIElements | null> {
     try {
       const storage = await this.loadStorageData();
-      const storedData = storage[deviceId];
+      const key = this.storageKey(deviceId, appId);
+      const storedData = storage[key];
 
       if (!storedData) {
-        logger.debug(`📱 No UI data found for device: ${deviceId}`);
+        logger.debug(`📱 No UI data found for device: ${deviceId} (${appId})`);
         return null;
       }
 
       if (!this.isDataValid(storedData)) {
-        logger.info(`⏰ UI data for device ${deviceId} is older than ${this.MAX_AGE_DAYS} days, will re-learn`);
+        logger.info(`⏰ UI data for device ${deviceId} (${appId}) is older than ${this.MAX_AGE_DAYS} days, will re-learn`);
         // Clean up old data
-        delete storage[deviceId];
+        delete storage[key];
         await this.saveStorageData(storage);
         return null;
       }
 
       const ageInDays = Math.floor((Date.now() - storedData.timestamp) / (1000 * 60 * 60 * 24));
-      logger.info(`✅ Loaded UI data for device ${deviceId} (${ageInDays} days old)`);
-      
+      logger.info(`✅ Loaded UI data for device ${deviceId} (${appId}, ${ageInDays} days old)`);
+
       return storedData.learnedUI;
     } catch (error) {
       logger.error(`❌ Failed to load UI data for device ${deviceId}:`, error);
@@ -114,27 +125,29 @@ export class UIDataPersistence {
   }
 
   /**
-   * Save learned UI data for specific device
+   * Save learned UI data for a specific device + app
    */
   static async saveDeviceUIData(
-    deviceId: string, 
-    deviceName: string, 
+    deviceId: string,
+    deviceName: string,
+    appId: string,
     learnedUI: LearnedUIElements
   ): Promise<void> {
     try {
       const storage = await this.loadStorageData();
-      
-      storage[deviceId] = {
+
+      storage[this.storageKey(deviceId, appId)] = {
         deviceId,
         deviceName,
+        appId,
         learnedUI,
         timestamp: Date.now(),
         version: this.CURRENT_VERSION,
       };
 
       await this.saveStorageData(storage);
-      logger.info(`💾 Saved UI data for device: ${deviceName} (${deviceId})`);
-      
+      logger.info(`💾 Saved UI data for device: ${deviceName} (${deviceId}, ${appId})`);
+
     } catch (error) {
       logger.error(`❌ Failed to save UI data for device ${deviceId}:`, error);
       throw error;

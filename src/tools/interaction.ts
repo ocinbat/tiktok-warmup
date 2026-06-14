@@ -126,7 +126,7 @@ const analyzeScreenshot = async (taskId: string, screenshot: string, query: stri
       {
         role: 'system',
         content: `You are a visual LLM for object detection and spatial understanding.
-        You are analyzing a TikTok app screenshot to find UI elements and answer any question from orechstation LLM agent who will ask you to analyze the screenshot.
+        You are analyzing a social media app screenshot (TikTok or Instagram Reels) to find UI elements and answer any question from the orchestration LLM agent who will ask you to analyze the screenshot.
         `,
       },
       {
@@ -167,7 +167,7 @@ const findObject = async (taskId: string, deviceId: string, deviceManager: Devic
           Return bounding box coordinates in format [y1, x1, y2, x2] normalized to 0-1000.
           Where y1,y2 are top/bottom coordinates and x1,x2 are left/right coordinates.
 
-          You are analyzing a TikTok app screenshot to find UI elements.
+          You are analyzing a social media app screenshot (TikTok or Instagram Reels) to find UI elements.
           If object is found, return box_2d coordinates and descriptive label.
           If object is NOT found, set found=false and explain why in another_response field.
           `,

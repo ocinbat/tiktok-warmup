@@ -209,9 +209,32 @@ adb devices  # Should list all connected devices
 
 ## ▶️ Usage
 
+### Choosing the app (TikTok / Instagram)
+The same engine drives either app — both are vertical video feeds (TikTok For You,
+Instagram Reels). Select one with `--app`; it defaults to `tiktok`.
+
+```bash
+pnpm start                       # TikTok (default)
+pnpm start --app tiktok          # TikTok, explicit
+pnpm start --app instagram       # Instagram Reels
+```
+
+| `--app` | App | Package | Notes |
+|---|---|---|---|
+| `tiktok` *(default)* | TikTok | `com.zhiliaoapp.musically` | Opens straight into the For You feed |
+| `instagram` | Instagram | `com.instagram.android` | Agent navigates to the **Reels** tab after launch |
+
+App-specific differences (package, load time, feed name, navigation) live in
+[`src/config/apps.ts`](src/config/apps.ts). Learned UI coordinates are cached
+per **device + app**, so switching apps re-learns the layout once instead of
+reusing the wrong button positions.
+
+> The target app must be **installed and logged in** on the device. For Instagram,
+> make sure the account can open Reels.
+
 ### Automatic Multi-Device
 ```bash
-# Run on all connected devices
+# Run on all connected devices (TikTok by default, or add --app instagram)
 pnpm start
 
 # System automatically:
@@ -226,8 +249,11 @@ pnpm start
 # Run on specific device
 pnpm start --device <device_id>
 
+# Instagram on a specific device
+pnpm start --app instagram --device <device_id>
+
 # Debugging with detailed logs
-DEBUG=agent:* pnpm start
+pnpm run dev          # equivalent to: pnpm start --debug
 ```
 
 ## 🔧 Configuration
