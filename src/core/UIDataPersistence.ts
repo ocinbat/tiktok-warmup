@@ -99,7 +99,19 @@ export class UIDataPersistence {
     try {
       const storage = await this.loadStorageData();
       const key = this.storageKey(deviceId, appId);
-      const storedData = storage[key];
+      let storedData = storage[key];
+
+      // Back-compat: data written before per-app keys existed was stored under the
+      // bare deviceId and is always TikTok. Adopt and migrate it under the new key
+      // so upgrading users don't get forced through an unnecessary re-learn (and so
+      // the deterministic initialize() -> 'working' auto-resume keeps working).
+      if (!storedData && appId === 'tiktok' && storage[deviceId]) {
+        storedData = { ...storage[deviceId], appId };
+        storage[key] = storedData;
+        delete storage[deviceId];
+        await this.saveStorageData(storage);
+        logger.info(`🔁 Migrated legacy UI data for device ${deviceId} to key ${key}`);
+      }
 
       if (!storedData) {
         logger.debug(`📱 No UI data found for device: ${deviceId} (${appId})`);

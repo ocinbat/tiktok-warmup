@@ -279,6 +279,30 @@ export async function interactWithScreen<T>(
             },
           },
           
+          tap_element: {
+            description: 'Find a UI element by description AND tap it in ONE step, returning the coordinates that were tapped. ALWAYS use this to tap something — never read coordinates with take_and_analyze_screenshot and then expect a separate tap. One element per call.',
+            parameters: z.object({
+              query: z.string().describe('Description of the element to find and tap, e.g. "the comment button (speech bubble icon on the right side)"'),
+            }),
+            execute: async ({ query }: { query: string }) => {
+              try {
+                const screenshot = await deviceManager.takeScreenshot(deviceId);
+                const findResult = await findObject(interactionTaskId, deviceId, deviceManager, screenshot, query);
+                const { coordinates } = findResult;
+                if (!findResult.found || !coordinates) {
+                  return { tapped: false, found: false, message: findResult.message ?? `Could not find: ${query}`, suggestion: 'Take a screenshot to see the current state, then try again.' };
+                }
+                await deviceManager.tapScreen(deviceId, coordinates.x, coordinates.y);
+                logger.info(`👆 [Interacting#${interactionTaskId}] Found and tapped "${query}" at (${coordinates.x}, ${coordinates.y})`);
+                return { tapped: true, found: true, coordinates, boundingBox: findResult.boundingBox, message: `Found and tapped ${query} at (${coordinates.x}, ${coordinates.y})` };
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                logger.warn(`[Interacting#${interactionTaskId}] tap_element failed (agent can retry): ${message}`);
+                return { tapped: false, found: false, error: true, message: `tap_element failed: ${message}. Take a fresh screenshot and try again.` };
+              }
+            },
+          },
+
           wait_for_ui: {
             description: 'Wait for UI elements to load completely',
             parameters: z.object({

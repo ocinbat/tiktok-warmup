@@ -199,14 +199,21 @@ export const visionLlm: LanguageModel = lazyModel(
 /**
  * Provider-specific options for the agentic `generateText` loop.
  *
- * Today this only disables Gemini's "thinking" budget to keep the tool-calling
- * loop fast and cheap. Other providers get no special options (returns
- * `undefined`), which is the safe default — sending Google-specific options to
- * MiniMax/Anthropic would be ignored or rejected.
+ * For Gemini we set the "thinking" budget. NOTE: gemini-2.5-pro REQUIRES thinking
+ * — a budget of 0 is rejected with "This model only works in thinking mode", so
+ * we default to -1 (dynamic: the model decides how much to think), which is valid
+ * for pro, flash and flash-lite. Override with GOOGLE_THINKING_BUDGET, e.g. set it
+ * to 0 on gemini-2.5-flash to turn thinking off for lower cost/latency.
+ *
+ * Other providers get no special options (returns `undefined`) — sending
+ * Google-specific options to MiniMax/Anthropic would be ignored or rejected.
  */
 export const getThinkingProviderOptions = (): { google: { thinkingConfig: { thinkingBudget: number } } } | undefined => {
   if (ACTIVE_PROVIDER === 'google') {
-    return { google: { thinkingConfig: { thinkingBudget: 0 } } };
+    const raw = process.env.GOOGLE_THINKING_BUDGET?.trim();
+    const parsed = raw ? Number(raw) : NaN;
+    const thinkingBudget = Number.isFinite(parsed) ? parsed : -1; // -1 = dynamic thinking
+    return { google: { thinkingConfig: { thinkingBudget } } };
   }
   return undefined;
 };

@@ -182,6 +182,14 @@ export class Worker {
           commentCloseButton: !!this.learnedUI.commentCloseButton,
         });
 
+        // The learning agent posts a test comment and confirms it appears in the
+        // list; this is the proof the send-button coordinate actually works.
+        if (result.commentPosted) {
+          logger.info(`💬 [Worker] Comment flow VERIFIED for ${this.deviceName} — test comment was posted and seen in the list.`);
+        } else {
+          logger.warn(`⚠️ [Worker] Comment flow NOT verified for ${this.deviceName} — the send-button coordinate is unconfirmed; the working stage will rely on its visual send fallback.`);
+        }
+
         // Save learned UI data for future use
         try {
           await UIDataPersistence.saveDeviceUIData(this.deviceId, this.deviceName, this.presets.app.id, this.learnedUI);
@@ -189,7 +197,14 @@ export class Worker {
           logger.warn(`⚠️ Failed to save UI data for ${this.deviceName}:`, error);
         }
 
-        this.currentStage = result.nextStage === 'working' ? 'working' : 'learning';
+        // Drive the transition from the coordinates we actually captured, NOT the
+        // model's free-text `nextStage` field. The orchestration LLM frequently
+        // returns nextStage:"learning" even on a fully successful learn (Gemini
+        // does this routinely), which used to strand the worker in 'learning' and
+        // the working loop never started. We are already inside the
+        // `result.success && result.appLaunched` block with learnedUI populated,
+        // so hasLearnedUI() is the real readiness signal.
+        this.currentStage = this.hasLearnedUI() ? 'working' : 'learning';
         return true;
         
       } else {

@@ -26,6 +26,10 @@ const uiElementSchema = z.object({
 const LearningResultSchema = z.object({
   success: z.boolean(),
   appLaunched: z.boolean(),
+  // True only if the agent actually posted the test comment by tapping SEND and
+  // then visually confirmed it appeared in the comment list. This is the proof
+  // that the learned send-button coordinate really works.
+  commentPosted: z.boolean().default(false),
   uiElementsFound: z.object({
     likeButton: uiElementSchema.default({ found: false }),
     commentButton: uiElementSchema.default({ found: false }),
@@ -33,9 +37,12 @@ const LearningResultSchema = z.object({
     commentSendButton: uiElementSchema.default({ found: false }),
     commentCloseButton: uiElementSchema.default({ found: false }),
   }).default({}),
-  nextStage: z.enum(['learning', 'working']),
-  message: z.string(),
-  stepsUsed: z.number(),
+  // Kept for schema completeness but NO LONGER load-bearing: Worker decides the
+  // transition from hasLearnedUI(), not this field. Default avoids a hard
+  // validation failure if the model omits it.
+  nextStage: z.enum(['learning', 'working']).default('working'),
+  message: z.string().default(''),
+  stepsUsed: z.number().default(0),
 });
 
 const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displayName} automation agent in the LEARNING stage. Your mission:
@@ -44,59 +51,40 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     If not - find the app and launch it
     ${app.feedNavigationHint ? `1b. **REACH THE FEED**: ${app.feedNavigationHint}\n` : ''}
     2. **THEN**: Take screenshots to analyze the ${app.displayName} ${app.feedName} interface
-    3. **FIND**: Locate key UI elements and their exact coordinates:
-      - Like button (heart icon, usually on right side)
-      - Comment button (speech bubble icon)
-    4. **LEARN COMMENT FLOW**: Practice comment writing sequence:
-      - Click comment button
-      - Wait 1 second for comment UI to load
-      - Take screenshot to analyze comment interface
-      - Find comment input field (text input area)
-      - Find send button (usually red/colored button)
-      - Test the full flow: click input → type test → find send button
+    3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step and returns the coordinates it tapped. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. Use take_and_analyze_screenshot(action="find_object") ONLY for the LIKE button, which you must read but NOT tap (tapping it would like a random video).
+
+    **YOUR REAL GOAL:** Do not just collect coordinates. You must PROVE the comment flow works by actually posting a short test comment and then VERIFYING it appears in the comment list. A send-button coordinate that was never tapped and confirmed is worthless — the working stage relies on it.
 
     **IMPORTANT RULES:**
-    - Use the provided tools to interact with the phone
-    - Take screenshots frequently to see current state.
-    - If ${app.displayName} is not open, launch it first using launch_app_activity
-    - Be patient - wait for UI to load between actions
-    - Try different approaches if first attempts fail
-    - **MUST LEARN COMMENT FLOW**: Don't finish until you've found comment input and send button
-    - **REQUIRED for success:** like button, comment button, comment input field, send button. The close/X button is OPTIONAL — the bot closes the comment panel with the Android back button, so you do NOT need its coordinate.
-    - **ALWAYS call finish_task.** The moment you have found the like, comment, input and send buttons and posted the test comment, call finish_task(success=true) immediately. Do NOT keep exploring and never run out of steps without calling finish_task.
+    - If ${app.displayName} is not open, launch it first with launch_app_activity${app.feedNavigationHint ? ', then reach the video feed as described above' : ''}.
+    - Wait for the UI to load between actions; use ONE query per screenshot call.
+    - To tap the SEND button, use tap_element (it presses it for you). Then you MUST verify the comment actually posted.
+    - **RECOVERY — very important:** The comment bar has icons (emoji, @, GIF, sticker, camera, photo/gallery) next to the text box; tapping one by mistake opens a PHOTO GALLERY / image picker or some other wrong screen. If you EVER find yourself on a gallery/picker or any screen that is NOT the comment panel, you tapped the wrong thing — pressKey(keycode="back") once or twice to return to the comment panel, then retry. NEVER keep searching for the send button on a gallery screen.
+    - **REQUIRED for success:** coordinates of like, comment, input field and send button, AND a verified posted test comment. The close/X button is OPTIONAL — the bot closes the panel with the Android back button.
+    - Never run out of steps without calling finish_task.
 
-
-    **Error Handling:**
-    - If you can't reach the goal. Maybe some coordinates are wrong. Try to find the object again.
-
-    ## Comment Learning Sequence:
-    1. Click comment button → wait 1s → screenshot
-    2. Find comment input field coordinates
-    3. Click input field → wait 1s → type "Nice video 👍" (or any other realistic test comment)
-    4. Take screenshot to confirm text entered
-    5. Find red/colored send button coordinates
-    6. Click send button to actually post the comment (complete the flow, not keyboard button, but the send button in the ${app.displayName} UI)
-    7. Wait 2s for comment to be posted
-    8. Close the comment panel. Most apps have NO X/close button — press the BACK button (use pressKey with keycode "back") or swipe down to dismiss it. Do NOT keep searching for an X button: take at most ONE screenshot to look for it, and if you don't see one, just press back.
-    9. The close/X button coordinate is OPTIONAL. If there is no visible X button, set commentCloseButton.found=false and move on — that is completely fine.
-    10. Save all the coordinates you found and call finish_task(success=true)
+    ## Exact step-by-step (follow in this order, one tool call per step):
+    1. take_and_analyze_screenshot(action="find_object", query="the like button, heart icon on the right side") → record LIKE coordinates. Do NOT tap it.
+    2. tap_element(query="the comment button, speech bubble icon on the right side") → opens the comment panel and returns the COMMENT button coordinates. Record them.
+    3. wait_for_ui(seconds=1), then take_and_analyze_screenshot to see the open comment panel.
+    4. tap_element(query="the comment text entry box on the LEFT of the bottom comment bar — the area with greyed placeholder text like 'Add comment' / 'Yorum ekle'. Tap the LEFT text area ONLY, NOT the emoji, @, GIF, sticker, camera or photo/gallery icons on the RIGHT of the bar") → focuses the text field and returns the INPUT FIELD coordinates. Record them.
+       After this the on-screen keyboard should appear. If instead a PHOTO GALLERY / image picker opens, you hit a photo icon: pressKey(keycode="back") to return to the comment panel, then repeat this step aiming further LEFT (smaller x).
+    5. inputText(text="nice video") → type the short test comment. (Only do this once the text field is focused and the keyboard is up — NOT on a gallery screen.)
+    6. tap_element(query="the send or post button at the right end of the comment input row (an arrow or 'Post' button), NOT the keyboard enter key") → this TAPS send and POSTS the comment, and returns the SEND button coordinates. Record them. (If tap_element reports it could not find the send button, take a screenshot, then try tap_element again with a more specific description.)
+    7. wait_for_ui(seconds=2) for the comment to be posted.
+    8. take_and_analyze_screenshot(action="answer_question", query="Did the test comment 'nice video' get posted — is it now visible in the list of comments? Answer clearly yes or no.") → this is the VERIFICATION. If it is NOT visible, the send tap missed: go back to step 6 and tap the send button again, then re-verify. (Do this at most twice.)
+    9. pressKey(keycode="back") once or twice to close the keyboard and comment panel.
+    10. finish_task.
 
     ## How to finish the learning stage
-    Run final function 'finish_task' with the result.
-    Do not close keyboard using other tools. it should be automatically by submitting comment.
+    Run 'finish_task'. If the comment panel is still open, press back to close it first.
 
-    **CRITICAL — fill finish_task.uiElementsFound correctly:**
-    - You MUST include EVERY element you located in the uiElementsFound object: likeButton, commentButton, commentInputField, commentSendButton, and commentCloseButton.
-    - For each element you found, set found:true and its exact pixel coordinates {x, y} taken from the find_object results. Do NOT put coordinates only in the "message" field — they MUST be inside uiElementsFound or they are lost.
-    - Example of a correctly filled element:
-        "commentButton": { "found": true, "coordinates": { "x": 1334, "y": 1705 } }
-    - commentCloseButton may be { "found": false } when the app has no X button (that is fine).
+    **Set the result fields like this:**
+    - commentPosted = true ONLY if step 8 confirmed the test comment is visible in the comment list; otherwise false.
+    - success = true ONLY if you found all four buttons AND commentPosted is true. If the comment never posted, return success=false (the send coordinate is not trustworthy).
+    - uiElementsFound: include EVERY element with found:true and its exact pixel {x, y} from the tap_element / find_object results. Do NOT put coordinates only in "message" — they must be inside uiElementsFound or they are lost. Example: "commentButton": { "found": true, "coordinates": { "x": 1334, "y": 1705 } }. commentCloseButton may be { "found": false }.
 
-    - When you have found like, comment, input field and send button, return success:true
-    - If any of those four is missing, return success:false
-
-
-    For screenshot, use take_and_analyze_screenshot tool. But use it only for one query per call. Like one for like button, one for comment button, one for input field, one for send button.
+    Use take_and_analyze_screenshot with ONE query per call.
     Start by checking device connection and launching ${app.displayName}!`
 
 /**

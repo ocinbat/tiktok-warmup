@@ -1020,32 +1020,20 @@ export class DeviceManager {
   }
 
   /**
-   * Enhanced text input with better emoji/special character support
+   * Enhanced text input. All methods delegate to {@link inputText}, which commits
+   * the full Unicode string (emoji included) in one shot via ADBKeyboard — the
+   * IME the bot switches to at startup — and falls back to char-by-char typing
+   * when ADBKeyboard isn't active.
+   *
+   * The `method` argument is kept for tool-call compatibility but is advisory.
+   * The old 'ime' path hardcoded `com.android.inputmethod.latin/.LatinIME`, which
+   * does not exist on many phones (e.g. Samsung) and made `adb ime set` fail hard,
+   * crashing the whole stage; the old 'clipboard' path (setClipboard + PASTE) was
+   * similarly unreliable. inputText() already handles all of this correctly.
    */
   async inputTextAdvanced(deviceId: string, text: string, method: 'standard' | 'ime' | 'clipboard' = 'standard'): Promise<string> {
-    try {
-      switch (method) {
-        case 'clipboard':
-          // Use clipboard for complex text
-          await this.setClipboard(deviceId, text);
-          await this.pressKey(deviceId, 'KEYCODE_PASTE');
-          break;
-        case 'ime':
-          // Use IME for international characters
-          await execAsync(`adb -s ${deviceId} shell ime set com.android.inputmethod.latin/.LatinIME`);
-          await this.inputText(deviceId, text);
-          break;
-        case 'standard':
-        default:
-          return await this.inputText(deviceId, text);
-      }
-      
-      logger.info(`⌨️ [DeviceManager] Advanced text input (${method}) "${text}" on ${deviceId}`);
-      return `Successfully input text using ${method} method: '${text}'`;
-    } catch (error) {
-      logger.error(`❌ Failed advanced text input on ${deviceId}:`, error);
-      throw new Error(`Failed advanced text input: ${error}`);
-    }
+    logger.debug(`⌨️ [DeviceManager] inputTextAdvanced(method=${method}) → inputText on ${deviceId}`);
+    return await this.inputText(deviceId, text);
   }
 
   getAsAiTools(deviceId: string): ToolSet {
@@ -1227,7 +1215,26 @@ export class DeviceManager {
         },
       },
     };
-    
+
+    // Make tool failures non-fatal: a single flaky adb command (a missing IME, a
+    // tap that misses, a transient device hiccup) should let the agent retry or
+    // pick another approach instead of aborting the whole stage with an
+    // AI_ToolExecutionError. Mirrors take_and_analyze_screenshot, which already
+    // returns an error object instead of throwing.
+    for (const [name, tool] of Object.entries(tools)) {
+      const originalExecute = (tool as { execute?: (...args: unknown[]) => Promise<unknown> }).execute;
+      if (typeof originalExecute !== 'function') continue;
+      (tool as { execute: (...args: unknown[]) => Promise<unknown> }).execute = async (...callArgs: unknown[]) => {
+        try {
+          return await originalExecute(...callArgs);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn(`⚠️ [DeviceManager] Tool "${name}" failed (non-fatal, agent can retry): ${message}`);
+          return { error: true, success: false, message: `Tool ${name} failed: ${message}. Try a different approach or another tool.` };
+        }
+      };
+    }
+
     return tools;
   }
 } 
