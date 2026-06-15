@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AutomationPresets } from '../config/presets.js';
 import type { LearnedUIElements } from '../core/Worker.js';
 import { interactWithScreen } from '../tools/interaction.js';
+import { verifyCommentPosted } from '../tools/uiVerify.js';
 import { logger } from '../tools/utils.js';
 
 import type { DeviceManager } from '@/core/DeviceManager.js';
@@ -247,13 +248,31 @@ export class WorkingStage {
 
       const { x, y } = this.learnedUI.likeButton;
       logger.info(`❤️ [Working] Liking video at (${x}, ${y})`);
-      
-      // Use deviceManager to tap
+
+      // Tap the like coordinate (this one was proven to toggle the like during
+      // the learning stage's test_like_button check).
       await this.deviceManager.tapScreen(this.deviceId, x, y);
-      
-      await this.wait(0.5, 'After like tap');
+      await this.wait(1, 'After like tap');
       this.stats.likesGiven++;
-      
+
+      // Verify for visibility/logging ONLY. We deliberately do NOT re-tap on a
+      // negative reading: the like button is a TOGGLE, so a retap driven by a
+      // flaky/hallucinated "not liked" answer would UNDO a like that actually
+      // registered. Correctness comes from the learning-stage verification of
+      // this coordinate, not from re-tapping here.
+      try {
+        const liked = (await this.takeAndAnalyzeScreenshot(
+          `Look at the like button (the heart icon on the right side of the video). Is it now in the LIKED state — filled/solid and red/colored — rather than an empty outline? Answer YES or NO.`
+        )).toUpperCase().includes('YES');
+        if (liked) {
+          logger.info(`❤️ [Working] Like confirmed registered`);
+        } else {
+          logger.warn(`⚠️ [Working] Like tap done but could not confirm it registered — if this persists, delete data/learned-ui-data.json and re-learn.`);
+        }
+      } catch (error) {
+        logger.debug(`[Working] Like verification skipped (non-fatal):`, error);
+      }
+
       return true;
     } catch (error) {
       logger.error(`❌ [Working] Like action failed:`, error);
@@ -308,9 +327,17 @@ export class WorkingStage {
       await this.wait(stepWait, 'After typing comment');
 
       // Confirm the comment actually shows up as a POSTED comment (not just text
-      // sitting in the input box).
+      // sitting in the input box). Objective view-hierarchy check first; vision
+      // yes/no only when uiautomator is unavailable (FLAG_SECURE / obfuscated /
+      // virtualized list) — same signal the learning stage now uses.
       const verifyPosted = async (): Promise<boolean> => {
         await this.wait(stepWait, 'Waiting for comment to post');
+        const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+        const objective = verifyCommentPosted(xml, commentText);
+        if (objective.usable) {
+          logger.info(`🔎 [Working] Post verification via uiautomator: posted=${objective.posted}`);
+          return objective.posted;
+        }
         const v = await this.takeAndAnalyzeScreenshot(
           `Did the comment get POSTED? Look at the posted comments list, NOT the input box. Is "${commentText}" shown as a posted comment in the list? Answer YES only if it appears as a posted comment, otherwise NO.`
         );

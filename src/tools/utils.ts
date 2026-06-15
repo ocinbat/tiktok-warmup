@@ -202,6 +202,29 @@ export const transliterateToAscii = (text: string): string => {
 };
 
 /**
+ * Read the pixel dimensions of a PNG straight from its header.
+ *
+ * Why this matters for tapping: `adb shell screencap` captures at the device's
+ * CURRENT display resolution, and `adb shell input tap` consumes coordinates in
+ * that exact same space. The vision model normalizes its bounding boxes to
+ * 0-1000 over the image it was given — so the correct denominator when turning a
+ * normalized box back into a tappable pixel is the screenshot's OWN dimensions,
+ * never `wm size` (which reports the physical size and is wrong whenever a
+ * display-size override is active). Returns null for anything that isn't a PNG.
+ *
+ * PNG layout: 8-byte signature, then the IHDR chunk whose width/height are
+ * big-endian uint32s at byte offsets 16 and 20.
+ */
+export const readPngDimensions = (buf: Buffer): { width: number; height: number } | null => {
+  // 0x89 'P' 'N' 'G' — the first four bytes of every PNG signature.
+  if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47) return null;
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (!width || !height) return null;
+  return { width, height };
+};
+
+/**
  * Check if string is valid JSON
  */
 export const isValidJson = (str: string): boolean => {

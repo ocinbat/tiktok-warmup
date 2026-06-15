@@ -6,7 +6,7 @@ import type { ToolSet } from 'ai';
 import { z } from 'zod';
 
 
-import { execAsync, logger, transliterateToAscii } from '../tools/utils.js';
+import { execAsync, logger, readPngDimensions, transliterateToAscii } from '../tools/utils.js';
 /**
  * Android device information
  */
@@ -51,9 +51,18 @@ export class DeviceManager {
   }
 
   /**
-   * Take screenshot and return as base64 PNG data
+   * Take a screenshot and return its base64 PNG data together with the image's
+   * real pixel dimensions (read from the PNG header).
+   *
+   * The dimensions are the single source of truth for converting a vision
+   * model's 0-1000 normalized box into a tappable coordinate: `screencap` and
+   * `input tap` both operate in the current display resolution, and the PNG is
+   * captured at exactly that resolution — so the screenshot's own width/height
+   * are the correct denominator (unlike `wm size`, which is wrong under a
+   * display-size override). Falls back to the cached wm-size resolution only if
+   * the PNG header can't be parsed.
    */
-  async takeScreenshot(deviceId: string): Promise<string> {
+  async takeScreenshotWithDims(deviceId: string): Promise<{ base64Data: string; width: number; height: number }> {
     const tempPath = `/sdcard/screenshot_${Date.now()}.png`;
     // os.tmpdir() resolves to the OS temp dir on every platform (e.g. %TEMP% on
     // Windows). A hardcoded /tmp does not exist on Windows.
@@ -62,24 +71,73 @@ export class DeviceManager {
     try {
       // Take screenshot on device
       await execAsync(`adb -s ${deviceId} shell screencap -p ${tempPath}`);
-      
-      // Pull to local temp file  
+
+      // Pull to local temp file
       await execAsync(`adb -s ${deviceId} pull ${tempPath} "${localTempFile}"`);
-      
-      // Read file as base64
+
+      // Read file as base64 and parse its real pixel dimensions
       const imageBuffer = await fs.readFile(localTempFile);
       const base64Data = imageBuffer.toString('base64');
-      
+      let dims = readPngDimensions(imageBuffer);
+
       // Clean up files
       await execAsync(`adb -s ${deviceId} shell rm ${tempPath}`);
       await fs.unlink(localTempFile);
-      
-      logger.debug(`📸 [DeviceManager] Screenshot captured for ${deviceId}, size: ${base64Data.length} chars`);
-      return base64Data;
-      
+
+      if (!dims) {
+        const { width, height } = (await this.getDeviceCapabilities(deviceId)).screenResolution;
+        logger.warn(`⚠️ [DeviceManager] Could not read PNG dimensions for ${deviceId}; falling back to wm size ${width}x${height}`);
+        dims = { width, height };
+      }
+
+      logger.debug(`📸 [DeviceManager] Screenshot captured for ${deviceId}, ${dims.width}x${dims.height}, size: ${base64Data.length} chars`);
+      return { base64Data, width: dims.width, height: dims.height };
+
     } catch (error) {
       logger.error(`❌ Failed to take screenshot for ${deviceId}:`, error);
       throw new Error(`Screenshot failed: ${error}`);
+    }
+  }
+
+  /**
+   * Take screenshot and return as base64 PNG data.
+   *
+   * Thin wrapper over {@link takeScreenshotWithDims} so existing callers that
+   * only need the image bytes keep working unchanged.
+   */
+  async takeScreenshot(deviceId: string): Promise<string> {
+    return (await this.takeScreenshotWithDims(deviceId)).base64Data;
+  }
+
+  /**
+   * Dump the current on-screen UI view hierarchy as XML (best effort).
+   *
+   * Used as an OBJECTIVE, non-hallucinating signal — e.g. to confirm a comment
+   * actually landed as a posted node and the input box was cleared. Returns an
+   * empty string (never throws) when the dump is unavailable: secure windows
+   * (FLAG_SECURE), mid-animation "could not get idle state" errors, or apps
+   * whose surfaces uiautomator can't read. The caller treats an empty result as
+   * "unknown" and falls back to vision.
+   */
+  async dumpViewHierarchy(deviceId: string): Promise<string> {
+    const tempPath = `/sdcard/window_dump_${Date.now()}.xml`;
+    const localTempFile = path.join(os.tmpdir(), `uidump_${deviceId}_${Date.now()}.xml`);
+    try {
+      const { stdout, stderr } = await execAsync(`adb -s ${deviceId} shell uiautomator dump ${tempPath}`);
+      // uiautomator prints "ERROR: could not get idle state." to stdout/stderr
+      // on failure and writes no file.
+      if (/ERROR|could not/i.test(`${stdout ?? ''} ${stderr ?? ''}`)) {
+        logger.debug(`[DeviceManager] uiautomator dump unavailable on ${deviceId}: ${stdout || stderr}`);
+        return '';
+      }
+      await execAsync(`adb -s ${deviceId} pull ${tempPath} "${localTempFile}"`);
+      const xml = await fs.readFile(localTempFile, 'utf-8');
+      await execAsync(`adb -s ${deviceId} shell rm ${tempPath}`).catch(() => undefined);
+      await fs.unlink(localTempFile).catch(() => undefined);
+      return xml;
+    } catch (error) {
+      logger.debug(`[DeviceManager] dumpViewHierarchy failed on ${deviceId} (falling back to vision): ${error instanceof Error ? error.message : String(error)}`);
+      return '';
     }
   }
 

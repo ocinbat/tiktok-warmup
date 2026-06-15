@@ -1,8 +1,14 @@
 import { z } from 'zod';
 
+import { type CapturedElement, ELEMENT_KEYS, ElementLedger } from '../tools/ElementLedger.js';
+import { logger } from '../tools/utils.js';
+
 import type { AppProfile } from '@/config/apps.js';
 import type { DeviceManager } from '@/core/DeviceManager.js';
 import { interactWithScreen } from '@/tools/interaction.js';
+
+/** The throwaway comment the learning stage posts to prove the send flow works. */
+const TEST_COMMENT = 'nice video';
 /**
  * One learned UI element. Only `found` matters structurally; the rest are
  * optional so a flaky model can't fail validation by omitting them.
@@ -51,38 +57,42 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     If not - find the app and launch it
     ${app.feedNavigationHint ? `1b. **REACH THE FEED**: ${app.feedNavigationHint}\n` : ''}
     2. **THEN**: Take screenshots to analyze the ${app.displayName} ${app.feedName} interface
-    3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step and returns the coordinates it tapped. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. Use take_and_analyze_screenshot(action="find_object") ONLY for the LIKE button, which you must read but NOT tap (tapping it would like a random video).
+    3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. For the LIKE button, use the dedicated **test_like_button** tool, which taps it to prove the coordinate works and then un-likes it so no random video stays liked.
 
-    **YOUR REAL GOAL:** Do not just collect coordinates. You must PROVE the comment flow works by actually posting a short test comment and then VERIFYING it appears in the comment list. A send-button coordinate that was never tapped and confirmed is worthless — the working stage relies on it.
+    4. **COORDINATES ARE RECORDED FOR YOU — do not copy any numbers.** On every tap_element call, pass the matching \`elementKey\` ("commentButton", "commentInputField", or "commentSendButton"); the like button is recorded by test_like_button. The system stores the exact coordinate it tapped under that key automatically. You NEVER read, remember, or type pixel coordinates yourself, and you do NOT put coordinates in finish_task. Your only job is to perform the flow correctly and confirm the like and comment worked.
+
+    **YOUR REAL GOAL:** PROVE both interactions work. (a) Test the LIKE button with test_like_button until it returns verified=true. (b) Post a short test comment "${TEST_COMMENT}" and confirm it with the **verify_comment_posted** tool (which objectively reads the screen). A like or send tap that was never confirmed is worthless — the working stage relies on these.
 
     **IMPORTANT RULES:**
-    - If ${app.displayName} is not open, launch it first with launch_app_activity${app.feedNavigationHint ? ', then reach the video feed as described above' : ''}.
+    - If ${app.displayName} is not open, launch it first${app.feedNavigationHint ? ', then reach the video feed as described above' : ''}.
     - Wait for the UI to load between actions; use ONE query per screenshot call.
-    - To tap the SEND button, use tap_element (it presses it for you). Then you MUST verify the comment actually posted.
+    - To tap the SEND button, use tap_element(elementKey="commentSendButton"). Then you MUST call verify_comment_posted.
     - **RECOVERY — very important:** The comment bar has icons (emoji, @, GIF, sticker, camera, photo/gallery) next to the text box; tapping one by mistake opens a PHOTO GALLERY / image picker or some other wrong screen. If you EVER find yourself on a gallery/picker or any screen that is NOT the comment panel, you tapped the wrong thing — pressKey(keycode="back") once or twice to return to the comment panel, then retry. NEVER keep searching for the send button on a gallery screen.
-    - **REQUIRED for success:** coordinates of like, comment, input field and send button, AND a verified posted test comment. The close/X button is OPTIONAL — the bot closes the panel with the Android back button.
+    - If a tap_element call reports the element was found OUTSIDE the screen bounds, it was a misdetection and was NOT tapped — take a fresh screenshot and retry with a more specific description.
     - Never run out of steps without calling finish_task.
 
     ## Exact step-by-step (follow in this order, one tool call per step):
-    1. take_and_analyze_screenshot(action="find_object", query="the like button, heart icon on the right side") → record LIKE coordinates. Do NOT tap it.
-    2. tap_element(query="the comment button, speech bubble icon on the right side") → opens the comment panel and returns the COMMENT button coordinates. Record them.
-    3. wait_for_ui(seconds=1), then take_and_analyze_screenshot to see the open comment panel.
-    4. tap_element(query="the comment text entry box on the LEFT of the bottom comment bar — the area with greyed placeholder text like 'Add comment' / 'Yorum ekle'. Tap the LEFT text area ONLY, NOT the emoji, @, GIF, sticker, camera or photo/gallery icons on the RIGHT of the bar") → focuses the text field and returns the INPUT FIELD coordinates. Record them.
+    1. test_like_button(query="the like button, heart icon on the right side of the video") → taps the like button, confirms the like registered, and un-likes it. If it returns verified=false, take a screenshot and call it again with a more specific description (at most twice). Then move on even if still unverified.
+    2. tap_element(elementKey="commentButton", query="the comment button, speech bubble icon on the right side") → opens the comment panel.
+    3. wait_for_ui(seconds=1), then take_and_analyze_screenshot(action="answer_question", query="Is the comment panel open with a text input box at the bottom?").
+    4. tap_element(elementKey="commentInputField", query="the comment text entry box on the LEFT of the bottom comment bar — the area with greyed placeholder text like 'Add comment' / 'Yorum ekle'. Tap the LEFT text area ONLY, NOT the emoji, @, GIF, sticker, camera or photo/gallery icons on the RIGHT of the bar").
        After this the on-screen keyboard should appear. If instead a PHOTO GALLERY / image picker opens, you hit a photo icon: pressKey(keycode="back") to return to the comment panel, then repeat this step aiming further LEFT (smaller x).
-    5. inputText(text="nice video") → type the short test comment. (Only do this once the text field is focused and the keyboard is up — NOT on a gallery screen.)
-    6. tap_element(query="the send or post button at the right end of the comment input row (an arrow or 'Post' button), NOT the keyboard enter key") → this TAPS send and POSTS the comment, and returns the SEND button coordinates. Record them. (If tap_element reports it could not find the send button, take a screenshot, then try tap_element again with a more specific description.)
-    7. wait_for_ui(seconds=2) for the comment to be posted.
-    8. take_and_analyze_screenshot(action="answer_question", query="Did the test comment 'nice video' get posted — is it now visible in the list of comments? Answer clearly yes or no.") → this is the VERIFICATION. If it is NOT visible, the send tap missed: go back to step 6 and tap the send button again, then re-verify. (Do this at most twice.)
-    9. pressKey(keycode="back") once or twice to close the keyboard and comment panel.
-    10. finish_task.
+    5. inputText(text="${TEST_COMMENT}") → type the short test comment. (Only once the text field is focused and the keyboard is up — NOT on a gallery screen.)
+    6. **PRE-SEND CHECK:** take_and_analyze_screenshot(action="answer_question", query="Is the exact text '${TEST_COMMENT}' now visible inside the comment input box? Answer strictly yes or no."). If the answer is NOT yes, the text did not land — tap_element(elementKey="commentInputField", ...) again and re-run inputText, then re-check. Do this at most twice. Do NOT tap send until the text is in the box.
+    7. tap_element(elementKey="commentSendButton", query="the send or post button at the right end of the comment input row (an arrow or 'Post' button), NOT the keyboard enter key") → this TAPS send. (If it could not find the send button, take a screenshot and retry with a more specific description.)
+    8. wait_for_ui(seconds=2) for the comment to post.
+    9. verify_comment_posted() → objective confirmation. If it returns posted=false, the send tap missed: tap_element(elementKey="commentSendButton", ...) again, wait, then call verify_comment_posted again. Do this at most twice.
+    10. pressKey(keycode="back") once or twice to close the keyboard and comment panel.
+    11. finish_task.
 
     ## How to finish the learning stage
     Run 'finish_task'. If the comment panel is still open, press back to close it first.
 
-    **Set the result fields like this:**
-    - commentPosted = true ONLY if step 8 confirmed the test comment is visible in the comment list; otherwise false.
-    - success = true ONLY if you found all four buttons AND commentPosted is true. If the comment never posted, return success=false (the send coordinate is not trustworthy).
-    - uiElementsFound: include EVERY element with found:true and its exact pixel {x, y} from the tap_element / find_object results. Do NOT put coordinates only in "message" — they must be inside uiElementsFound or they are lost. Example: "commentButton": { "found": true, "coordinates": { "x": 1334, "y": 1705 } }. commentCloseButton may be { "found": false }.
+    **finish_task fields (coordinates are NOT needed — they are recorded automatically):**
+    - appLaunched = true if you reached the ${app.feedName}.
+    - For each element you successfully interacted with (via test_like_button / tap_element), set uiElementsFound.<key>.found = true. You may omit coordinates entirely.
+    - commentPosted = true only if verify_comment_posted returned posted=true. (The system independently re-computes this, so be honest.)
+    - success = true if you tested the like button and found comment, input and send buttons and the comment was confirmed posted.
 
     Use take_and_analyze_screenshot with ONE query per call.
     Start by checking device connection and launching ${app.displayName}!`
@@ -103,12 +113,119 @@ export class LearningStage {
   }
 
   /**
-   * Execute learning stage with AI agent
+   * Execute learning stage with AI agent.
+   *
+   * The model drives the on-device flow, but the AUTHORITATIVE result is built
+   * here in code from the ElementLedger (coordinates captured at tap time) and
+   * the objective verify_comment_posted signal — never from numbers or success
+   * flags the model self-reports. This is what makes "thought it learned the
+   * coordinates / thought it sent the comment" impossible to fake.
    */
   async execute(): Promise<z.infer<typeof LearningResultSchema>> {
     console.log(`🧠 [Learning] Starting learning stage for device: ${this.deviceId} (${this.app.displayName})`);
 
-    return await interactWithScreen<z.infer<typeof LearningResultSchema>>(buildLearningPrompt(this.app), this.deviceId, this.deviceManager, {}, LearningResultSchema);
+    const ledger = new ElementLedger();
+
+    // The model's finish_task payload is now only advisory; we keep it for
+    // appLaunched / message and as a sanity log, but recompute everything that
+    // matters from the ledger.
+    const modelResult = await interactWithScreen<z.infer<typeof LearningResultSchema>>(
+      buildLearningPrompt(this.app),
+      this.deviceId,
+      this.deviceManager,
+      {},
+      LearningResultSchema,
+      { ledger, verifyComment: { expectedText: TEST_COMMENT }, testLike: true },
+    );
+
+    return this.buildResultFromLedger(ledger, modelResult);
+  }
+
+  /**
+   * Turn the captured ledger + objective verification into the LearningResult
+   * the Worker consumes. Coordinates come straight from the recorded taps;
+   * success/commentPosted are computed, not trusted.
+   */
+  private buildResultFromLedger(
+    ledger: ElementLedger,
+    modelResult: z.infer<typeof LearningResultSchema>,
+  ): z.infer<typeof LearningResultSchema> {
+    const input = ledger.getBest('commentInputField');
+
+    // Choose the send button as the most recent in-bounds tap that genuinely sits
+    // in the input row — to the RIGHT of the input field and at roughly its
+    // height. This prevents a stray tap elsewhere (e.g. on the right-side like
+    // rail) from ever being saved as the send button, even if it got locked.
+    const sendPlausible = (e: CapturedElement): boolean => {
+      if (!input) return true;
+      const rowBand = 0.18 * (e.imgHeight || input.imgHeight || 2000);
+      return e.x >= input.x && Math.abs(e.y - input.y) <= rowBand;
+    };
+    const sendEntry = ledger.selectBest('commentSendButton', sendPlausible);
+    const sendIsPlausible = !!sendEntry && sendPlausible(sendEntry);
+
+    const uiElementsFound = {
+      likeButton: this.entryToUiElement(ledger.getBest('likeButton')),
+      commentButton: this.entryToUiElement(ledger.getBest('commentButton')),
+      commentInputField: this.entryToUiElement(input),
+      commentSendButton: this.entryToUiElement(sendEntry),
+      commentCloseButton: this.entryToUiElement(ledger.getBest('commentCloseButton')),
+    };
+    const send = uiElementsFound.commentSendButton;
+    if (send.found && !sendIsPlausible) {
+      logger.warn(`⚠️ [Learning] Send button coordinate is not in the input row (likely a stray detection); marking it low-confidence so the working stage uses its visual fallback.`);
+      send.confidence = Math.min(send.confidence ?? 0.6, 0.4);
+    }
+
+    const requiredFound =
+      uiElementsFound.likeButton.found &&
+      uiElementsFound.commentButton.found &&
+      uiElementsFound.commentInputField.found &&
+      uiElementsFound.commentSendButton.found;
+
+    const appLaunched = Boolean(modelResult.appLaunched) || ELEMENT_KEYS.some((k) => ledger.has(k));
+
+    // likeVerified / commentPosted are OBJECTIVE signals (the tap was proven to
+    // toggle the like / the comment was confirmed posted), not the model's claim.
+    // When true the coordinate was locked to the exact tap that worked, so bump
+    // its confidence; the working stage trusts high-confidence coords first.
+    const likeVerified = ledger.likeVerified;
+    if (likeVerified && uiElementsFound.likeButton.found) uiElementsFound.likeButton.confidence = 0.99;
+
+    const commentPosted = ledger.commentVerified;
+    if (commentPosted && send.found && sendIsPlausible) send.confidence = 0.99;
+
+    // success gates only whether the working stage can start (all four coords
+    // captured). It intentionally does NOT require the like/comment to be verified:
+    // an unverified run still saves real, in-bounds coordinates and the working
+    // stage's visual fallbacks cover them — far better than refusing to learn.
+    const success = appLaunched && requiredFound;
+
+    const commentNote = commentPosted ? ` (verified via ${ledger.verifiedBy})` : '';
+    const foundSummary = `like=${uiElementsFound.likeButton.found} comment=${uiElementsFound.commentButton.found} input=${uiElementsFound.commentInputField.found} send=${uiElementsFound.commentSendButton.found}`;
+    logger.info(`🧠 [Learning] Result computed from ledger — success=${success}, likeVerified=${likeVerified}, commentPosted=${commentPosted}${commentNote}, found: ${foundSummary}`);
+
+    return {
+      success,
+      appLaunched,
+      commentPosted,
+      uiElementsFound,
+      nextStage: success ? 'working' : 'learning',
+      message: modelResult.message || (success ? 'Learning complete (coordinates captured from real taps).' : 'Learning incomplete — not all required elements were captured.'),
+      stepsUsed: modelResult.stepsUsed ?? 0,
+    };
+  }
+
+  /** Build one uiElementsFound entry from a captured ledger entry. */
+  private entryToUiElement(best: CapturedElement | undefined): z.infer<typeof uiElementSchema> {
+    if (!best) return { found: false };
+    return {
+      found: true,
+      coordinates: { x: best.x, y: best.y },
+      boundingBox: best.boundingBox,
+      confidence: best.confidence,
+      label: best.label,
+    };
   }
 
   /**
