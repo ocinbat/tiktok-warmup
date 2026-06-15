@@ -355,13 +355,17 @@ export async function interactWithScreen<T>(
 
           take_and_analyze_screenshot: {
             description: 'Take a screenshot and ask Visual LLM to analyze it, like return coordinates of the UI element or something else. one task per screenshot. One object to find = one request',
+            // Defaults guard against a model emitting malformed/partial args.
             parameters: z.object({
-              query: z.string().describe('The query to the LLM, like "find the like button" or "analyze the screenshot"'),
-              action: z.enum(['answer_question', 'find_object']),
+              query: z.string().default('').describe('The query to the LLM, like "find the like button" or "analyze the screenshot"'),
+              action: z.enum(['answer_question', 'find_object']).default('answer_question'),
               elementKey: elementKeyParam,
             }),
             execute: async ({ query, action, elementKey }: { query: string, action: 'answer_question' | 'find_object', elementKey?: ElementKey }) => {
               try {
+                if (!query.trim()) {
+                  return { error: true, found: false, message: 'No query provided. Call again with a clear query describing what to find/answer.' };
+                }
                 if(action === 'answer_question') {
                   const screenshot = await deviceManager.takeScreenshot(deviceId);
                   const analysisResult = await analyzeScreenshot(interactionTaskId, screenshot, query);
@@ -388,11 +392,14 @@ export async function interactWithScreen<T>(
           tap_element: {
             description: 'Find a UI element by description AND tap it in ONE step, returning the coordinates that were tapped. ALWAYS use this to tap something — never read coordinates with take_and_analyze_screenshot and then expect a separate tap. One element per call.',
             parameters: z.object({
-              query: z.string().describe('Description of the element to find and tap, e.g. "the comment button (speech bubble icon on the right side)"'),
+              query: z.string().default('').describe('Description of the element to find and tap, e.g. "the comment button (speech bubble icon on the right side)"'),
               elementKey: elementKeyParam,
             }),
             execute: async ({ query, elementKey }: { query: string, elementKey?: ElementKey }) => {
               try {
+                if (!query.trim()) {
+                  return { tapped: false, found: false, message: 'No element description provided. Call tap_element again with a clear query.' };
+                }
                 const shot = await deviceManager.takeScreenshotWithDims(deviceId);
                 const findResult = await findObject(interactionTaskId, shot, query);
                 const { coordinates } = findResult;
@@ -416,9 +423,13 @@ export async function interactWithScreen<T>(
 
           wait_for_ui: {
             description: 'Wait for UI elements to load completely',
+            // Defaults make this resilient to a model that emits a malformed
+            // tool call (e.g. MiniMax occasionally garbles the JSON args): a
+            // missing/garbled field falls back to a sane value instead of
+            // throwing AI_InvalidToolArgumentsError and killing the whole stage.
             parameters: z.object({
-              seconds: z.number().min(1).max(10),
-              reason: z.string(),
+              seconds: z.number().min(1).max(10).default(2),
+              reason: z.string().default('waiting for UI to settle'),
             }),
             execute: async ({ seconds, reason }: { seconds: number, reason: string }) => {
               logger.info(`⏳ [Learning#${interactionTaskId}] Waiting ${seconds}s for: ${reason}`);
@@ -427,18 +438,18 @@ export async function interactWithScreen<T>(
             },
           },
 
-          // Composite, in-code like-button test (learning only). Instead of merely
-          // READING the like coordinate (which is never proven to work), it taps
-          // the button and PROVES the tap toggled the like state, then taps again
+          // Composite, in-code like test (learning only). Instead of merely
+          // READING the like coordinate (which is never proven to work), it TAPS
+          // the heart and proves the tap toggled the like state, then taps again
           // to restore (un-like) so no random video is left liked. The verified
           // coordinate is recorded and locked. The before→after→restore cycle is
           // robust against a constantly-"yes" vision model: a real toggle must
           // read unliked→liked→unliked, which a constant answer can never satisfy.
           ...(testLike ? {
             test_like_button: {
-              description: 'Find the like (heart) button, TAP it to test, confirm the like registered, then un-like it to leave no trace — all in one call. Use this ONCE for the like button instead of find_object. If it returns verified=false, take a screenshot and call it again with a more specific description (at most twice).',
+              description: 'Find the like (heart) button, TAP it to test, confirm the like registered, then un-like it to leave no trace — all in one call. Use this ONCE for the like step instead of find_object. If it returns verified=false, take a screenshot and call it again with a more specific heart description (at most twice).',
               parameters: z.object({
-                query: z.string().default('the like button, heart icon on the right side of the video').describe('Description of the like/heart button to find'),
+                query: z.string().default('the like button, heart icon on the right side of the video').describe('Description of the like/heart icon to find and tap'),
               }),
               execute: async ({ query }: { query: string }) => {
                 const readLiked = async (): Promise<boolean> => {
@@ -459,7 +470,7 @@ export async function interactWithScreen<T>(
                     return { verified: false, found: false, message: findResult.message ?? `Could not find the like button: ${query}`, suggestion: 'Take a screenshot and try again with a more specific description.' };
                   }
 
-                  // Record the real, in-bounds coordinate as a candidate up front.
+                  // Record the real, in-bounds heart coordinate as a candidate.
                   recordToLedger('likeButton', findResult, true);
 
                   const before = await readLiked();

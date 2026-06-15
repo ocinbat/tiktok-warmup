@@ -44,6 +44,19 @@ export interface AutomationPresets {
 const COMMENT_LANGUAGE = process.env.COMMENT_LANGUAGE?.trim() || 'English';
 
 /**
+ * Read a 0..1 probability from an env var, falling back to a default. Used to
+ * tune (or, while testing the like/comment flow, temporarily crank up) how often
+ * the bot likes/comments without editing code. e.g. LIKE_CHANCE=1 COMMENT_CHANCE=1
+ * makes it like and comment on every video.
+ */
+const parseChance = (envName: string, fallback: number): number => {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+};
+
+/**
  * Offline fallback templates per language (used when AI generation is off or
  * fails). Kept ASCII / diacritic-free so they type cleanly over adb.
  */
@@ -75,8 +88,11 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
   },
   
   interactions: {
-    likeChance: 0.0167,       // Like ~1 in 60 videos (statistical, per-video probability)
-    commentChance: 0.005,     // Comment ~1 in 200 videos (statistical, per-video probability)
+    // Defaults stay conservative (human-like, lower shadowban risk). Override with
+    // LIKE_CHANCE / COMMENT_CHANCE env vars — e.g. set both to 1 to exercise the
+    // like/comment flow on every video while verifying the learned coordinates.
+    likeChance: parseChance('LIKE_CHANCE', 0.0167),     // ~1 in 60 videos by default
+    commentChance: parseChance('COMMENT_CHANCE', 0.005), // ~1 in 200 videos by default
     dailyLimit: 500,          // Max 500 actions per day
   },
   

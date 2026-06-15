@@ -246,20 +246,19 @@ export class WorkingStage {
         return false;
       }
 
+      // Tap the learned heart coordinate. The learning stage's test_like_button
+      // PROVED this exact coordinate toggles the like (tap → liked → untap), so a
+      // single tap here reliably likes the video.
       const { x, y } = this.learnedUI.likeButton;
       logger.info(`❤️ [Working] Liking video at (${x}, ${y})`);
-
-      // Tap the like coordinate (this one was proven to toggle the like during
-      // the learning stage's test_like_button check).
       await this.deviceManager.tapScreen(this.deviceId, x, y);
       await this.wait(1, 'After like tap');
       this.stats.likesGiven++;
 
-      // Verify for visibility/logging ONLY. We deliberately do NOT re-tap on a
-      // negative reading: the like button is a TOGGLE, so a retap driven by a
-      // flaky/hallucinated "not liked" answer would UNDO a like that actually
-      // registered. Correctness comes from the learning-stage verification of
-      // this coordinate, not from re-tapping here.
+      // Verify for visibility/logging ONLY. We do NOT re-tap on a negative
+      // reading: the like is a TOGGLE, so a retap driven by a flaky reading would
+      // UNDO a like that actually registered. Correctness comes from the learned
+      // coordinate having been verified during learning.
       try {
         const liked = (await this.takeAndAnalyzeScreenshot(
           `Look at the like button (the heart icon on the right side of the video). Is it now in the LIKED state — filled/solid and red/colored — rather than an empty outline? Answer YES or NO.`
@@ -622,19 +621,23 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
 **Your mission (maximum 3-4 steps):**
 1. Take screenshot to check current state
 2. If the ${app.displayName} ${app.feedName} is already visible -> call finish_task immediately with success:true
-3. If ${app.displayName} is not running -> launch it, wait, verify, then finish_task
-${app.feedNavigationHint ? `4. ${app.feedNavigationHint}\n` : ''}If something is wrong, try to fix it, if you can't, call finish_task with success:false
-You can tap, swipe, scroll, etc.
+3. If ${app.displayName} is NOT on the ${app.feedName} (wrong screen, an ad, a login/popup, a DIFFERENT app, the home screen, etc.) -> COLD-RESTART it: terminateApp(packageName="${app.appPackage}"), then launchApp(packageName="${app.appPackage}"), then wait, then verify.
+${app.feedNavigationHint ? `4. ${app.feedNavigationHint}\n` : ''}
+
+**HARD RULES — do NOT break these:**
+- The ONLY way you may recover is terminateApp + launchApp (cold restart). Do this if you are not on the feed.
+- NEVER press the home/back/recents keys and NEVER tap or swipe at guessed coordinates to "find" the app — that opens OTHER apps (e.g. a weather app) and makes things worse. Tapping/swiping is only allowed once you have CONFIRMED you are already on the ${app.feedName}.
+- If after 3 cold-restart attempts the ${app.feedName} still isn't visible, call finish_task with success:false (the app may need a manual login).
 
 **STEP-BY-STEP FLOW:**
-1. take_and_analyze_screenshot(query="Is the ${app.displayName} app open and is the ${app.feedName} (full-screen vertical video) visible?", action="answer_question")
-2. IF result shows the ${app.feedName} ready -> finish_task(success=true, message="${app.displayName} is already running")
-3. IF not ready -> launch_app_activity(package_name="${app.appPackage}")
-4. wait_for_ui(seconds=5, reason="Wait for ${app.displayName} to load after launching")
+1. take_and_analyze_screenshot(query="Is the ${app.displayName} app open and is the ${app.feedName} (full-screen vertical video with like/comment icons on the right) visible? If you see a login screen, an ad, a popup, the home screen, or a different app, answer that it is NOT the feed.", action="answer_question")
+2. IF the ${app.feedName} is ready -> finish_task(success=true, message="${app.displayName} feed is ready")
+3. IF not ready -> terminateApp(packageName="${app.appPackage}"), then launchApp(packageName="${app.appPackage}")
+4. wait_for_ui(seconds=5, reason="Wait for ${app.displayName} to cold-start")
 5. ${app.feedNavigationHint ? 'Navigate to the video feed as described above, then ' : ''}take_and_analyze_screenshot to verify
 6. finish_task with final result
 
-**STOP RULE: Call finish_task when the ${app.feedName} is confirmed ready or if after 10 attempts you can't fix it!**`;
+**STOP RULE: Call finish_task when the ${app.feedName} is confirmed ready, or with success:false after 3 cold-restart attempts.**`;
 
     const ResultSchema = z.object({
       success: z.boolean(),

@@ -29,7 +29,12 @@ export class UIDataPersistence {
   private static readonly DATA_FILE = 'learned-ui-data.json';
   private static readonly DATA_DIR = 'data';
   private static readonly MAX_AGE_DAYS = 30;
-  private static readonly CURRENT_VERSION = '1.0.0';
+  // Bump this whenever the LEARNING LOGIC changes how coordinates are captured or
+  // verified. Saved data from an older version is then auto-rejected on load so
+  // the device re-learns with the improved flow — no manual JSON deletion needed.
+  //   1.0.0  legacy (LLM-transcribed coords, vision-only "did it post?")
+  //   2.0.0  ledger-captured coords, objective verify, like test, send plausibility
+  private static readonly CURRENT_VERSION = '2.0.0';
 
   /**
    * Get full path to data file
@@ -115,6 +120,16 @@ export class UIDataPersistence {
 
       if (!storedData) {
         logger.debug(`📱 No UI data found for device: ${deviceId} (${appId})`);
+        return null;
+      }
+
+      // Reject data learned by an older learning algorithm so improvements to the
+      // learning stage take effect automatically (e.g. like-tap testing, send
+      // plausibility) instead of being skipped because stale coordinates exist.
+      if (storedData.version !== this.CURRENT_VERSION) {
+        logger.info(`♻️ UI data for device ${deviceId} (${appId}) was learned by an older version (${storedData.version ?? 'unknown'} ≠ ${this.CURRENT_VERSION}); re-learning with the current flow.`);
+        delete storage[key];
+        await this.saveStorageData(storage);
         return null;
       }
 

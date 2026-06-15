@@ -57,7 +57,7 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     If not - find the app and launch it
     ${app.feedNavigationHint ? `1b. **REACH THE FEED**: ${app.feedNavigationHint}\n` : ''}
     2. **THEN**: Take screenshots to analyze the ${app.displayName} ${app.feedName} interface
-    3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. For the LIKE button, use the dedicated **test_like_button** tool, which taps it to prove the coordinate works and then un-likes it so no random video stays liked.
+    3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. For the LIKE button, use the dedicated **test_like_button** tool, which taps the heart to prove the coordinate works and then un-likes it so no random video stays liked.
 
     4. **COORDINATES ARE RECORDED FOR YOU — do not copy any numbers.** On every tap_element call, pass the matching \`elementKey\` ("commentButton", "commentInputField", or "commentSendButton"); the like button is recorded by test_like_button. The system stores the exact coordinate it tapped under that key automatically. You NEVER read, remember, or type pixel coordinates yourself, and you do NOT put coordinates in finish_task. Your only job is to perform the flow correctly and confirm the like and comment worked.
 
@@ -72,7 +72,7 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     - Never run out of steps without calling finish_task.
 
     ## Exact step-by-step (follow in this order, one tool call per step):
-    1. test_like_button(query="the like button, heart icon on the right side of the video") → taps the like button, confirms the like registered, and un-likes it. If it returns verified=false, take a screenshot and call it again with a more specific description (at most twice). Then move on even if still unverified.
+    1. test_like_button(query="the like button, heart icon on the right side of the video") → taps the heart to like, confirms the like registered, and un-likes it. If it returns verified=false, take a screenshot and call it again with a more specific description (at most twice). Then move on even if still unverified.
     2. tap_element(elementKey="commentButton", query="the comment button, speech bubble icon on the right side") → opens the comment panel.
     3. wait_for_ui(seconds=1), then take_and_analyze_screenshot(action="answer_question", query="Is the comment panel open with a text input box at the bottom?").
     4. tap_element(elementKey="commentInputField", query="the comment text entry box on the LEFT of the bottom comment bar — the area with greyed placeholder text like 'Add comment' / 'Yorum ekle'. Tap the LEFT text area ONLY, NOT the emoji, @, GIF, sticker, camera or photo/gallery icons on the RIGHT of the bar").
@@ -124,21 +124,67 @@ export class LearningStage {
   async execute(): Promise<z.infer<typeof LearningResultSchema>> {
     console.log(`🧠 [Learning] Starting learning stage for device: ${this.deviceId} (${this.app.displayName})`);
 
-    const ledger = new ElementLedger();
+    // The orchestration model occasionally emits a malformed tool call (MiniMax
+    // M3 sometimes garbles the JSON args), which makes the AI SDK throw and would
+    // otherwise abort the whole learn even after useful coordinates were already
+    // captured. Retry the run a couple of times; between attempts the glitch
+    // usually clears. The ledger of the LAST attempt is salvaged at the end.
+    const maxAttempts = Number(process.env.LEARNING_MAX_ATTEMPTS) || 2;
+    let lastError: unknown;
+    let lastLedger = new ElementLedger();
 
-    // The model's finish_task payload is now only advisory; we keep it for
-    // appLaunched / message and as a sanity log, but recompute everything that
-    // matters from the ledger.
-    const modelResult = await interactWithScreen<z.infer<typeof LearningResultSchema>>(
-      buildLearningPrompt(this.app),
-      this.deviceId,
-      this.deviceManager,
-      {},
-      LearningResultSchema,
-      { ledger, verifyComment: { expectedText: TEST_COMMENT }, testLike: true },
-    );
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const ledger = new ElementLedger();
+      lastLedger = ledger;
+      try {
+        // The model's finish_task payload is only advisory; we keep it for
+        // appLaunched / message and recompute everything that matters from the
+        // ledger.
+        const modelResult = await interactWithScreen<z.infer<typeof LearningResultSchema>>(
+          buildLearningPrompt(this.app),
+          this.deviceId,
+          this.deviceManager,
+          {},
+          LearningResultSchema,
+          { ledger, verifyComment: { expectedText: TEST_COMMENT }, testLike: true },
+        );
+        return this.buildResultFromLedger(ledger, modelResult);
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn(`⚠️ [Learning] Attempt ${attempt}/${maxAttempts} failed (${message})${attempt < maxAttempts ? ' — retrying' : ''}`);
+      }
+    }
 
-    return this.buildResultFromLedger(ledger, modelResult);
+    // Every attempt threw. Salvage whatever the last attempt captured: if all the
+    // required coordinates landed in the ledger before the crash, the learn still
+    // succeeded enough to proceed to the working stage.
+    const salvaged = this.buildResultFromLedger(lastLedger, this.emptyModelResult());
+    if (salvaged.success) {
+      logger.info(`✅ [Learning] Recovered the required coordinates from the ledger despite a tool-call error.`);
+    } else {
+      logger.error(`❌ [Learning] Failed after ${maxAttempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    }
+    return salvaged;
+  }
+
+  /** Minimal placeholder result used when the model loop threw before finishing. */
+  private emptyModelResult(): z.infer<typeof LearningResultSchema> {
+    return {
+      success: false,
+      appLaunched: false,
+      commentPosted: false,
+      uiElementsFound: {
+        likeButton: { found: false },
+        commentButton: { found: false },
+        commentInputField: { found: false },
+        commentSendButton: { found: false },
+        commentCloseButton: { found: false },
+      },
+      nextStage: 'learning',
+      message: '',
+      stepsUsed: 0,
+    };
   }
 
   /**

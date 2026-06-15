@@ -374,6 +374,11 @@ export class Worker {
     this.currentStage = 'initiating';
     logger.info(`🚀 [Worker] Initiating stage: launching ${app.displayName} on ${this.deviceName}`);
     try {
+      // Cold-start: force-stop first so we never inherit a stale screen (a login
+      // page, an ad, a profile view, or — if a previous run wandered off — a
+      // different app entirely). A fresh launch reliably lands on the feed.
+      await this.deviceManager.terminateApp(this.deviceId, app.appPackage).catch(() => undefined);
+      await new Promise(res => setTimeout(res, 1000));
       await this.deviceManager.launchApp(this.deviceId, app.appPackage);
       logger.info(`⏳ [Worker] Waiting ${app.loadTime}s for ${app.displayName} to load`);
       await new Promise(res => setTimeout(res, app.loadTime * 1000));
