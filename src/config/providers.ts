@@ -117,7 +117,14 @@ const buildModelFor = (
         baseURL: requireEnv('OPENAI_COMPATIBLE_BASE_URL', context),
         apiKey: requireEnv('OPENAI_COMPATIBLE_API_KEY', context),
       });
-      return { model: provider2(modelId), modelId };
+      const model = provider2(modelId);
+      // Use OpenAI "structured outputs" (response_format: json_schema) for generateObject
+      // instead of the legacy json_object mode. LM Studio and most modern OpenAI-compatible
+      // servers REJECT json_object with HTTP 400 ("'response_format.type' must be
+      // 'json_schema' or 'text'"). createOpenAICompatible() doesn't forward this flag, but
+      // the model reads it per-request, so setting it on the instance is enough.
+      (model as unknown as { supportsStructuredOutputs?: boolean }).supportsStructuredOutputs = true;
+      return { model, modelId };
     }
 
     default:

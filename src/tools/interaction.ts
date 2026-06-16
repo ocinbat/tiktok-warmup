@@ -41,9 +41,40 @@ interface Screenshot {
  */
 const AGENT_MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 40;
 
+/**
+ * Optional hard cap on tokens generated per agent step. Unset = no cap (the
+ * default for cloud models like Gemini). Set AGENT_MAX_OUTPUT_TOKENS (e.g. 4096)
+ * to rein in a verbose local reasoning model that burns 15-20k reasoning tokens
+ * per call. WARNING: setting it too low can cut a reasoning model off before it
+ * emits its tool call — keep it generous (>= 2048).
+ */
+const AGENT_MAX_OUTPUT_TOKENS = Number(process.env.AGENT_MAX_OUTPUT_TOKENS) || undefined;
+
+/**
+ * Order of the 4 numbers a vision model returns for a bounding box.
+ * - Gemini returns [y1, x1, y2, x2] (y-first) — the default.
+ * - Qwen-VL and most OpenAI-style vision models return [x1, y1, x2, y2] (x-first).
+ * Set VISION_BOX_ORDER=xyxy for those. A wrong order swaps X and Y, so taps land
+ * in the wrong place (e.g. opening the camera instead of liking).
+ */
+const VISION_BOX_XY_FIRST = process.env.VISION_BOX_ORDER?.trim().toLowerCase() === 'xyxy';
+
 /** True for the AI SDK error thrown when the model returns no parseable object. */
 const isNoObjectGenerated = (error: unknown): boolean =>
   error instanceof Error && error.name === 'AI_NoObjectGeneratedError';
+
+/**
+ * True for an OpenAI-compatible server that rejected the structured-output
+ * response_format we sent (e.g. LM Studio's HTTP 400 "'response_format.type'
+ * must be 'json_schema' or 'text'"). The text fallback below sends no
+ * response_format, so it succeeds where the structured request was refused.
+ */
+const isUnsupportedResponseFormat = (error: unknown): boolean => {
+  if (!(error instanceof Error) || error.name !== 'AI_APICallError') return false;
+  const status = (error as { statusCode?: number }).statusCode;
+  const haystack = `${String((error as { responseBody?: unknown }).responseBody ?? '')} ${error.message}`;
+  return status === 400 && /response_format|json_schema|json_object/.test(haystack);
+};
 
 /** Best-effort shape hint for a Zod object schema, used in the JSON fallback prompt. */
 const describeSchemaShape = (schema: z.ZodTypeAny): string => {
@@ -100,9 +131,9 @@ async function generateStructured<T>(params: {
     });
     return result.object as T;
   } catch (error) {
-    if (!isNoObjectGenerated(error)) throw error;
+    if (!isNoObjectGenerated(error) && !isUnsupportedResponseFormat(error)) throw error;
 
-    logger.warn(`⚠️ Structured output missing; falling back to text+JSON parse (${schemaName ?? 'object'})`);
+    logger.warn(`⚠️ Structured output failed (${isUnsupportedResponseFormat(error) ? 'response_format rejected' : 'no object'}); falling back to text+JSON parse (${schemaName ?? 'object'})`);
     const jsonInstruction =
       `Respond with ONLY a single valid JSON object and nothing else — no prose, no explanation, ` +
       `no markdown code fences. The JSON must match this shape:\n${describeSchemaShape(schema)}`;
@@ -251,7 +282,11 @@ const findObject = async (taskId: string, shot: Screenshot, query: string) => {
 
     // Process and return structured result
     if (detection.found && detection.box_2d.length === 4) {
-      const [y1, x1, y2, x2] = detection.box_2d;
+      const [a, b, c, d] = detection.box_2d;
+      // Map the 4 numbers to named edges according to the model's convention.
+      const { y1, x1, y2, x2 } = VISION_BOX_XY_FIRST
+        ? { x1: a, y1: b, x2: c, y2: d }
+        : { y1: a, x1: b, y2: c, x2: d };
 
       // Convert normalized coordinates to pixel coordinates (image == tap space)
       const pixelCoords = convertToPixelCoordinates({ y1, x1, y2, x2 }, imgWidth, imgHeight);
@@ -348,6 +383,7 @@ export async function interactWithScreen<T>(
         model: llm,
         prompt,
         providerOptions: getThinkingProviderOptions(),
+        maxOutputTokens: AGENT_MAX_OUTPUT_TOKENS,
         stopWhen: [hasToolCall('finish_task'), stepCountIs(AGENT_MAX_STEPS)],
         
         tools: {

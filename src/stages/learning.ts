@@ -53,8 +53,7 @@ const LearningResultSchema = z.object({
 
 const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displayName} automation agent in the LEARNING stage. Your mission:
 
-    1. **FIRST**: Check device connection and launch the ${app.displayName} app
-    If not - find the app and launch it
+    1. **FIRST**: ${app.displayName} has ALREADY been launched for you and should be on screen — take ONE screenshot to confirm. Only if it is genuinely NOT open, launch it with launch_app_activity(package_name="${app.appPackage}"). NEVER guess the package name — use exactly "${app.appPackage}". Do NOT call launch repeatedly.
     ${app.feedNavigationHint ? `1b. **REACH THE FEED**: ${app.feedNavigationHint}\n` : ''}
     2. **THEN**: Take screenshots to analyze the ${app.displayName} ${app.feedName} interface
     3. **How to TAP — this is critical.** ALWAYS use the **tap_element** tool to tap anything (comment button, input field, AND the send button). tap_element finds the element AND taps it in ONE step. NEVER just read coordinates with take_and_analyze_screenshot and then expect a separate tap to happen — that is exactly what makes you loop forever without ever pressing the button. For the LIKE button, use the dedicated **test_like_button** tool, which taps the heart to prove the coordinate works and then un-likes it so no random video stays liked.
@@ -64,7 +63,7 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     **YOUR REAL GOAL:** PROVE both interactions work. (a) Test the LIKE button with test_like_button until it returns verified=true. (b) Post a short test comment "${TEST_COMMENT}" and confirm it with the **verify_comment_posted** tool (which objectively reads the screen). A like or send tap that was never confirmed is worthless — the working stage relies on these.
 
     **IMPORTANT RULES:**
-    - If ${app.displayName} is not open, launch it first${app.feedNavigationHint ? ', then reach the video feed as described above' : ''}.
+    - ${app.displayName} is already open. If it somehow is not, launch it with launch_app_activity(package_name="${app.appPackage}") — never guess the package name${app.feedNavigationHint ? ', then reach the video feed as described above' : ''}.
     - Wait for the UI to load between actions; use ONE query per screenshot call.
     - To tap the SEND button, use tap_element(elementKey="commentSendButton"). Then you MUST call verify_comment_posted.
     - **RECOVERY — very important:** The comment bar has icons (emoji, @, GIF, sticker, camera, photo/gallery) next to the text box; tapping one by mistake opens a PHOTO GALLERY / image picker or some other wrong screen. If you EVER find yourself on a gallery/picker or any screen that is NOT the comment panel, you tapped the wrong thing — pressKey(keycode="back") once or twice to return to the comment panel, then retry. NEVER keep searching for the send button on a gallery screen.
@@ -95,7 +94,7 @@ const buildLearningPrompt = (app: AppProfile): string => `You are a ${app.displa
     - success = true if you tested the like button and found comment, input and send buttons and the comment was confirmed posted.
 
     Use take_and_analyze_screenshot with ONE query per call.
-    Start by checking device connection and launching ${app.displayName}!`
+    Start by taking ONE screenshot to confirm ${app.displayName} is open (it was already launched), then begin at step 1.`
 
 /**
  * Learning Stage Implementation
