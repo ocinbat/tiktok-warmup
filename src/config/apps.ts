@@ -28,6 +28,16 @@ export interface AppProfile {
    * (TikTok). Non-empty for apps that land elsewhere first (Instagram → Reels).
    */
   feedNavigationHint: string;
+  /**
+   * How to find & tap the FOLLOW control on a feed video, injected into the
+   * niche-follow prompts. Empty string disables the follow feature for this app.
+   */
+  followButtonHint: string;
+  /**
+   * How to read, from the screen, whether we ALREADY follow the current creator
+   * (so the bot never re-taps an already-followed account).
+   */
+  followStateHint: string;
 }
 
 export const APP_PROFILES: Record<AppId, AppProfile> = {
@@ -39,6 +49,15 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
     feedName: 'For You feed',
     // TikTok opens directly into the full-screen vertical feed — no navigation needed.
     feedNavigationHint: '',
+    followButtonHint:
+      'On TikTok the follow control is the small RED circle with a white PLUS (+) sign attached to the ' +
+      'BOTTOM edge of the round profile avatar, in the right-side action column, directly ABOVE the ' +
+      'heart/like icon. Tap ONLY that red + badge to follow — do NOT tap the avatar photo itself (that ' +
+      'opens the profile page).',
+    followStateHint:
+      'On TikTok the red + badge under the avatar is shown ONLY when you do NOT follow the creator. ' +
+      'If the avatar has a red + under it → NOT following. If the + badge is gone (just the round avatar) → ' +
+      'already following.',
   },
   instagram: {
     id: 'instagram',
@@ -53,6 +72,13 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       'full-screen vertical videos with the like (heart), comment (speech bubble) and share icons stacked ' +
       'on the RIGHT side, and you swipe UP to move to the next video — it behaves just like the TikTok feed. ' +
       'Make sure you are on Reels before locating buttons, liking, or commenting.',
+    followButtonHint:
+      'On Instagram Reels the follow control is the "Follow" / "Takip et" button shown next to the creator ' +
+      'username (near the bottom-left caption, often an outlined pill button), or a small + on the avatar in ' +
+      'the right-side column. Tap that "Follow" button — do NOT tap the username/avatar (that opens the profile).',
+    followStateHint:
+      'On Instagram, if the button next to the username says "Follow" / "Takip et" → NOT following. ' +
+      'If it says "Following" / "Takip ediliyor", or there is no follow button next to the username → already following.',
   },
 };
 

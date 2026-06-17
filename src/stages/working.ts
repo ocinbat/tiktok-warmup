@@ -16,8 +16,29 @@ export const WorkingResultSchema = z.object({
   videosWatched: z.number(),
   likesGiven: z.number(),
   commentsPosted: z.number(),
+  followsGiven: z.number(),
   shouldContinue: z.boolean(),
   message: z.string(),
+});
+
+/**
+ * Niche-follow analysis — read-only judgement of the CURRENT creator. The bot
+ * follows only creators that match BOTH the target niche and language and that
+ * we do not already follow.
+ */
+export const NicheFollowAnalysisSchema = z.object({
+  screenLooksLikeNormalFeed: z.boolean().describe('true if this is a normal full-screen feed video (NOT a shop, profile page, ad, popup, DM, search, etc.)'),
+  matchesNiche: z.boolean().describe('true ONLY if the video/creator is clearly about the target niche'),
+  isTargetLanguage: z.boolean().describe('true ONLY if the creator/content is primarily in the target language'),
+  alreadyFollowing: z.boolean().describe('true if we ALREADY follow this creator (follow control gone / says Following / no + badge)'),
+  creatorNote: z.string().describe('short note: creator handle/username and what the video is about'),
+  confidence: z.string().describe('Confidence level: high/medium/low'),
+});
+
+/** Result of a follow attempt. */
+export const FollowActionSchema = z.object({
+  followed: z.boolean().describe('true ONLY if the follow was confirmed (control changed to the followed state)'),
+  note: z.string().optional().describe('short note about what happened'),
 });
 
 /**
@@ -74,12 +95,15 @@ export class WorkingStage {
     videosWatched: 0,
     likesGiven: 0,
     commentsPosted: 0,
+    followsGiven: 0,
     errors: 0,
     sessionStartTime: Date.now(),
     lastActivityTime: Date.now(),
   };
   private healthFailures = 0;
   private healthFailureExceeded = false;
+  /** Logged once when the per-session follow cap is hit, to avoid spamming. */
+  private followLimitLogged = false;
 
   constructor(
     deviceId: string, 
@@ -393,6 +417,126 @@ export class WorkingStage {
   }
 
   /**
+   * Niche-follow scan — independent of like/comment. On a FOLLOW_CHANCE roll,
+   * analyze the CURRENT creator and, if it's a target-niche + target-language
+   * channel we don't already follow, follow it. Kept conservative with a
+   * per-session cap because following many accounts quickly is a strong ban
+   * signal. Runs on the clean feed BEFORE like/comment (which open/close panels).
+   */
+  async maybeFollowCreator(): Promise<void> {
+    const { follow, app } = this.presets;
+    // Disabled, or this app has no follow control configured.
+    if (!follow.enabled || !app.followButtonHint) return;
+
+    // Independent per-video probability — most videos are never scanned.
+    if (Math.random() >= follow.chance) return;
+
+    // Safety cap for the session.
+    if (this.stats.followsGiven >= follow.dailyLimit) {
+      if (!this.followLimitLogged) {
+        logger.info(`🛑 [Working] Follow cap reached (${follow.dailyLimit}); no more follows this session`);
+        this.followLimitLogged = true;
+      }
+      return;
+    }
+
+    try {
+      logger.info(`🔎 [Working] Niche-follow scan (niche="${follow.niche}", language=${follow.language})`);
+      const analysis = await this.analyzeForNicheFollow();
+      logger.info(
+        `🔎 [Working] Follow scan: niche=${analysis.matchesNiche} lang=${analysis.isTargetLanguage} ` +
+          `alreadyFollowing=${analysis.alreadyFollowing} normalFeed=${analysis.screenLooksLikeNormalFeed} ` +
+          `(${analysis.confidence}) — ${analysis.creatorNote}`,
+      );
+
+      if (!analysis.screenLooksLikeNormalFeed) return;
+      if (!analysis.matchesNiche || !analysis.isTargetLanguage) return;
+      if (analysis.alreadyFollowing) {
+        logger.info(`➡️ [Working] Already following this ${follow.language} ${follow.niche.split(' ')[0]} creator; skipping`);
+        return;
+      }
+
+      const followed = await this.executeFollow();
+      if (followed) {
+        this.stats.followsGiven++;
+        logger.info(`➕ [Working] Followed creator (${this.stats.followsGiven}/${follow.dailyLimit} this session): ${analysis.creatorNote}`);
+      } else {
+        logger.warn(`⚠️ [Working] Follow attempt not confirmed; leaving as-is`);
+      }
+    } catch (error) {
+      // A follow scan must never break the main loop.
+      logger.warn(`⚠️ [Working] Niche-follow scan failed (non-fatal):`, error);
+    }
+  }
+
+  /**
+   * Read-only analysis of the current creator for the niche-follow decision.
+   */
+  private async analyzeForNicheFollow(): Promise<z.infer<typeof NicheFollowAnalysisSchema>> {
+    const { follow, app } = this.presets;
+    const prompt = `You are a ${app.displayName} audience-growth analyst. Decide whether we should FOLLOW the creator of the CURRENT video.
+
+We follow a creator ONLY when BOTH are true:
+  • the video/creator is about this niche: ${follow.niche}
+  • the content is primarily in this language: ${follow.language}
+…and we do NOT already follow them.
+
+**CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
+
+**Workflow (use take_and_analyze_screenshot with ONE query per call; do NOT tap anything — this is analysis only):**
+1. take_and_analyze_screenshot(query="Describe this ${app.displayName} video: its main topic/niche, the language of the caption / on-screen text / speech, and the creator's username/handle.", action="answer_question")
+2. take_and_analyze_screenshot(query="${app.followStateHint} Looking at the screen, are we ALREADY following this creator? Also describe the follow control you can see. ${app.followButtonHint}", action="answer_question")
+3. finish_task with all fields filled in.
+
+**RULES:**
+- matchesNiche = true ONLY if the video is clearly about: ${follow.niche}.
+- isTargetLanguage = true ONLY if the caption / speech / handle are primarily ${follow.language}.
+- alreadyFollowing: ${app.followStateHint}
+- When unsure, set matchesNiche / isTargetLanguage to FALSE — do NOT follow when in doubt.
+
+**STOP RULE: Call finish_task once you have looked at the video content and the follow control.**`;
+
+    return interactWithScreen<z.infer<typeof NicheFollowAnalysisSchema>>(
+      prompt,
+      this.deviceId,
+      this.deviceManager,
+      {},
+      NicheFollowAnalysisSchema,
+    );
+  }
+
+  /**
+   * Tap the follow control for the current creator and confirm the state changed.
+   * Uses on-demand vision (tap_element) rather than a learned coordinate, since
+   * follows are rare and the avatar/badge position is stable but app-specific.
+   */
+  private async executeFollow(): Promise<boolean> {
+    const { app } = this.presets;
+    const prompt = `You are a ${app.displayName} automation agent. FOLLOW the creator of the CURRENT video, then confirm it.
+
+${app.followButtonHint}
+
+**CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
+
+**Steps:**
+1. tap_element(query="the follow control on this video — ${app.followButtonHint}") — tap it ONCE. Do NOT tap the avatar photo / username itself (that opens the profile page).
+2. take_and_analyze_screenshot(query="Did the follow succeed? ${app.followStateHint} State whether we are now FOLLOWING this creator, AND whether we are still on the normal full-screen video feed (not a profile page).", action="answer_question")
+3. **RECOVERY — REQUIRED:** if you are NOT on the normal video feed anymore (e.g. a profile page opened, or any other screen), pressKey(keycode="back") — repeat up to twice — until you are back on the full-screen video feed. You MUST end on the feed.
+4. finish_task with followed=true ONLY if the control changed to the followed state (e.g. the + badge disappeared / it now says Following); otherwise followed=false.
+
+**STOP RULE: Always finish on the video feed, then call finish_task with the followed boolean.**`;
+
+    const result = await interactWithScreen<z.infer<typeof FollowActionSchema>>(
+      prompt,
+      this.deviceId,
+      this.deviceManager,
+      {},
+      FollowActionSchema,
+    );
+    return result.followed;
+  }
+
+  /**
    * Scroll to next video
    */
   async scrollToNextVideo(): Promise<boolean> {
@@ -478,6 +622,10 @@ export class WorkingStage {
         }
       }
       
+      // Step 2.5: Independent niche-follow scan on the clean feed, BEFORE
+      // like/comment actions (which open/close panels and move the avatar).
+      await this.maybeFollowCreator();
+
       // Step 3 + 4: Decide actions and scroll to next video
       const decisions = await this.decideAction();
       logger.info(`🎯 [Working] Decided to do ${decisions.length} actions: ${decisions.map(d => d.action).join(', ')}`);
@@ -748,6 +896,7 @@ Check if the like button appears active/highlighted (usually red heart) which wo
         videosWatched: 0,
         likesGiven: 0,
         commentsPosted: 0,
+        followsGiven: 0,
         shouldContinue: false,
         message: `Failed to ensure ${this.presets.app.displayName} is ready for automation`,
       };
@@ -783,8 +932,8 @@ Check if the like button appears active/highlighted (usually red heart) which wo
           const sessionDuration = (Date.now() - this.stats.sessionStartTime) / 1000 / 60; // minutes
           const videosPerMinute = (this.stats.videosWatched / sessionDuration).toFixed(1);
           const engagementRate = ((this.stats.likesGiven + this.stats.commentsPosted) / this.stats.videosWatched * 100).toFixed(1);
-          
-          logger.info(`📊 [Working] Progress: ${this.stats.videosWatched} videos, ${this.stats.likesGiven} likes, ${this.stats.commentsPosted} comments`);
+
+          logger.info(`📊 [Working] Progress: ${this.stats.videosWatched} videos, ${this.stats.likesGiven} likes, ${this.stats.commentsPosted} comments, ${this.stats.followsGiven} follows`);
           logger.info(`📈 [Working] Metrics: ${videosPerMinute} videos/min, ${engagementRate}% engagement rate, ${sessionDuration.toFixed(1)}m session`);
         }
       }
@@ -796,6 +945,7 @@ Check if the like button appears active/highlighted (usually red heart) which wo
           videosWatched: this.stats.videosWatched,
           likesGiven: this.stats.likesGiven,
           commentsPosted: this.stats.commentsPosted,
+          followsGiven: this.stats.followsGiven,
           shouldContinue: false,
           message: 'Health check failed 3 times. Delete data/learned-ui-data.json and rerun learning stage.',
         };
@@ -806,8 +956,9 @@ Check if the like button appears active/highlighted (usually red heart) which wo
         videosWatched: this.stats.videosWatched,
         likesGiven: this.stats.likesGiven,
         commentsPosted: this.stats.commentsPosted,
+        followsGiven: this.stats.followsGiven,
         shouldContinue,
-        message: `Automation completed. Videos: ${this.stats.videosWatched}, Likes: ${this.stats.likesGiven}, Comments: ${this.stats.commentsPosted}`,
+        message: `Automation completed. Videos: ${this.stats.videosWatched}, Likes: ${this.stats.likesGiven}, Comments: ${this.stats.commentsPosted}, Follows: ${this.stats.followsGiven}`,
       };
       
     } catch (error) {
@@ -817,6 +968,7 @@ Check if the like button appears active/highlighted (usually red heart) which wo
         videosWatched: this.stats.videosWatched,
         likesGiven: this.stats.likesGiven,
         commentsPosted: this.stats.commentsPosted,
+        followsGiven: this.stats.followsGiven,
         shouldContinue: false,
         message: `Automation failed: ${error}`,
       };

@@ -26,7 +26,17 @@ export interface AutomationPresets {
     useAI: boolean;
     maxLength: number;
   };
-  
+
+  // Niche-follow: grow the account by following creators in a target niche.
+  // Independent of like/comment — its own per-video scan probability.
+  follow: {
+    enabled: boolean;       // master switch (FOLLOW_ENABLED)
+    niche: string;          // topic to match, e.g. skincare (FOLLOW_NICHE)
+    language: string;       // creator language to match, e.g. Turkish (FOLLOW_LANGUAGE)
+    chance: number;         // 0-1 per-video probability of running a follow scan (FOLLOW_CHANCE)
+    dailyLimit: number;     // max follows per session (safety cap, FOLLOW_DAILY_LIMIT)
+  };
+
   // Control settings for health checks, errors, and ban detection
   control: {
     healthCheckInterval: number;   // number of videos between health checks
@@ -55,6 +65,40 @@ const parseChance = (envName: string, fallback: number): number => {
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
 };
+
+/** Read a boolean env var (1/true/yes/on vs 0/false/no/off), falling back to a default. */
+const parseBool = (envName: string, fallback: boolean): boolean => {
+  const raw = process.env[envName]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  return fallback;
+};
+
+/** Read a non-negative integer env var, falling back to a default. */
+const parsePositiveInt = (envName: string, fallback: number): number => {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : fallback;
+};
+
+/** Read a non-empty string env var, falling back to a default (empty -> fallback). */
+const parseString = (envName: string, fallback: string): string => {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return fallback;
+  return raw;
+};
+
+/**
+ * Niche-follow targeting. Defaults grow a Turkish skincare ("cilt bakımı")
+ * audience; override with FOLLOW_NICHE / FOLLOW_LANGUAGE for a different niche.
+ */
+const FOLLOW_NICHE = parseString(
+  'FOLLOW_NICHE',
+  'skincare / cilt bakımı (skincare routines, derma/beauty, cleansers, serums, sunscreen, dermatologist tips)',
+);
+const FOLLOW_LANGUAGE = parseString('FOLLOW_LANGUAGE', 'Turkish');
 
 /**
  * Offline fallback templates per language (used when AI generation is off or
@@ -91,18 +135,29 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     // Defaults stay conservative (human-like, lower shadowban risk). Override with
     // LIKE_CHANCE / COMMENT_CHANCE env vars — e.g. set both to 1 to exercise the
     // like/comment flow on every video while verifying the learned coordinates.
-    likeChance: parseChance('LIKE_CHANCE', 0.0167),     // ~1 in 60 videos by default
-    commentChance: parseChance('COMMENT_CHANCE', 0.005), // ~1 in 200 videos by default
+    // Baseline raised 33% over the original 0.0167 / 0.005.
+    likeChance: parseChance('LIKE_CHANCE', 0.0222),      // +33% → ~1 in 45 videos by default
+    commentChance: parseChance('COMMENT_CHANCE', 0.00665), // +33% → ~1 in 150 videos by default
     dailyLimit: 500,          // Max 500 actions per day
   },
-  
+
   comments: {
     language: COMMENT_LANGUAGE,
     templates: COMMENT_TEMPLATES[COMMENT_LANGUAGE] ?? COMMENT_TEMPLATES.English,
     useAI: true,
     maxLength: 50,
   },
-  
+
+  follow: {
+    enabled: parseBool('FOLLOW_ENABLED', true),
+    niche: FOLLOW_NICHE,
+    language: FOLLOW_LANGUAGE,
+    // ~1 in 25 videos gets a follow scan; only niche+language matches are followed.
+    chance: parseChance('FOLLOW_CHANCE', 0.04),
+    // Conservative cap — following many accounts quickly is a strong ban signal.
+    dailyLimit: parsePositiveInt('FOLLOW_DAILY_LIMIT', 30),
+  },
+
   control: {
     healthCheckInterval: 100, // Every 100 videos check screen if it is healthy and looks like the app's video feed
     maxHealthFailures: 3, // Max 3 health check failures before retraining UI coordinates

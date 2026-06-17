@@ -33,6 +33,7 @@ export interface WorkerStats {
   videosWatched: number;
   likesGiven: number;
   commentsPosted: number;
+  followsGiven: number;
   uptime: number;
   startTime: number;
 }
@@ -79,6 +80,7 @@ export class Worker {
       videosWatched: 0,
       likesGiven: 0,
       commentsPosted: 0,
+      followsGiven: 0,
       uptime: 0,
       startTime: Date.now(),
     };
@@ -344,14 +346,16 @@ export class Worker {
         this.learnedUI,
       );
       
+      // Always record what this run actually did, even on a failed exit
+      // (health-check exceeded / exception) — those results still carry real
+      // counts, and dropping them would zero out the session's performance stats.
+      this.stats.videosWatched += result.videosWatched;
+      this.stats.likesGiven += result.likesGiven;
+      this.stats.commentsPosted += result.commentsPosted;
+      this.stats.followsGiven += result.followsGiven;
+
       if (result.success) {
         logger.info(`✅ [Worker] Working stage completed for ${this.deviceName}: ${result.message}`);
-        
-        // Update stats
-        this.stats.videosWatched += result.videosWatched;
-        this.stats.likesGiven += result.likesGiven;
-        this.stats.commentsPosted += result.commentsPosted;
-        
         return true;
       } else {
         logger.error(`❌ [Worker] Working stage failed for ${this.deviceName}: ${result.message}`);

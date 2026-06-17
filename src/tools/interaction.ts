@@ -1,9 +1,9 @@
 /* eslint-disable no-duplicate-imports */
-import type { ModelMessage, ToolSet } from "ai";
-import { generateObject, generateText, hasToolCall, stepCountIs } from "ai";
+import type { ModelMessage, ToolCallRepairFunction, ToolSet } from "ai";
+import { generateObject, generateText, hasToolCall, NoSuchToolError, stepCountIs } from "ai";
 import { z } from "zod";
 
-import type { ElementKey, ElementLedger } from "./ElementLedger.js";
+import { ELEMENT_KEYS, type ElementKey, type ElementLedger } from "./ElementLedger.js";
 import { getThinkingProviderOptions, llm, visionLlm } from "./llm.js";
 import { verifyCommentPosted } from "./uiVerify.js";
 import { logger, uuidv4 } from "./utils.js";
@@ -75,6 +75,18 @@ const isUnsupportedResponseFormat = (error: unknown): boolean => {
   const haystack = `${String((error as { responseBody?: unknown }).responseBody ?? '')} ${error.message}`;
   return status === 400 && /response_format|json_schema|json_object/.test(haystack);
 };
+
+/**
+ * Coerce a model-supplied elementKey to a known ledger key, or undefined.
+ * The param used to be a strict z.enum, which threw AI_InvalidToolArgumentsError
+ * (and killed the whole stage) the moment a model passed anything else — e.g. a
+ * local model inventing elementKey="reelsTab" to tap a nav tab. We now accept any
+ * string and simply ignore unknown ones: only real keys get recorded in the
+ * ledger, and the tap itself still happens via the `query`.
+ */
+const ELEMENT_KEY_SET: ReadonlySet<string> = new Set(ELEMENT_KEYS);
+const normalizeElementKey = (value: unknown): ElementKey | undefined =>
+  typeof value === 'string' && ELEMENT_KEY_SET.has(value) ? (value as ElementKey) : undefined;
 
 /** Best-effort shape hint for a Zod object schema, used in the JSON fallback prompt. */
 const describeSchemaShape = (schema: z.ZodTypeAny): string => {
@@ -373,19 +385,66 @@ export async function interactWithScreen<T>(
       });
     };
 
-    /** elementKey param shared by tap_element / find_object when a ledger is active. */
+    /**
+     * elementKey param shared by tap_element / find_object when a ledger is active.
+     * Lenient on purpose: a free-form string instead of a strict z.enum, so an
+     * unexpected value from a (local) model is ignored rather than throwing
+     * AI_InvalidToolArgumentsError and killing the stage. Only the known keys
+     * below are recorded (see normalizeElementKey).
+     */
     const elementKeyParam = z
-      .enum(['likeButton', 'commentButton', 'commentInputField', 'commentSendButton', 'commentCloseButton'])
+      .string()
       .optional()
-      .describe('Which learned UI element this call corresponds to, so the system can record the real coordinate. Pass it on EVERY tap_element/find_object for a tracked button.');
+      .describe(
+        `Which learned UI element this call corresponds to, so the system can record the real coordinate. ` +
+          `Must be exactly one of: ${ELEMENT_KEYS.join(', ')}. Pass it on EVERY tap_element/find_object for one of ` +
+          `those tracked buttons; OMIT it for anything else (e.g. a navigation tab). Unknown values are ignored, not errors.`,
+      );
+
+    /**
+     * Last-resort salvage for a tool call a model botched, so the AI SDK doesn't
+     * throw AI_InvalidToolArgumentsError / AI_NoSuchToolError out of generateText
+     * and kill the whole stage. Cloud models (Gemini) rarely trip this; small
+     * local models (e.g. qwen3-vl-8b) regularly tack on extra/unknown args. We
+     * only run on error, so the happy path is untouched. The fix is conservative:
+     * drop top-level keys the tool's schema doesn't declare and re-emit. If
+     * there's nothing safe to strip (or the tool itself is unknown), give up
+     * (return null) and let the original error surface.
+     */
+    const repairToolCall: ToolCallRepairFunction<ToolSet> = async ({ toolCall, parameterSchema, error }) => {
+      if (NoSuchToolError.isInstance(error)) {
+        logger.warn(`[Interacting#${interactionTaskId}] Model called unknown tool "${toolCall.toolName}" — cannot repair.`);
+        return null;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(toolCall.args);
+      } catch {
+        return null;
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      const schema = parameterSchema({ toolName: toolCall.toolName }) as { properties?: Record<string, unknown> } | undefined;
+      const allowed = schema?.properties;
+      if (!allowed) return null;
+      const cleaned: Record<string, unknown> = {};
+      const dropped: string[] = [];
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (key in allowed) cleaned[key] = value;
+        else dropped.push(key);
+      }
+      if (dropped.length === 0) return null; // nothing we know how to fix
+      logger.warn(`[Interacting#${interactionTaskId}] Repairing ${toolCall.toolName} call: dropped unknown arg(s) ${dropped.join(', ')}.`);
+      return { ...toolCall, args: JSON.stringify(cleaned) };
+    };
 
     await generateText({
         model: llm,
         prompt,
         providerOptions: getThinkingProviderOptions(),
         maxOutputTokens: AGENT_MAX_OUTPUT_TOKENS,
+        experimental_repairToolCall: repairToolCall,
         stopWhen: [hasToolCall('finish_task'), stepCountIs(AGENT_MAX_STEPS)],
-        
+
         tools: {
           ...deviceManager.getAsAiTools(deviceId),
 
@@ -394,26 +453,28 @@ export async function interactWithScreen<T>(
             // Defaults guard against a model emitting malformed/partial args.
             parameters: z.object({
               query: z.string().default('').describe('The query to the LLM, like "find the like button" or "analyze the screenshot"'),
-              action: z.enum(['answer_question', 'find_object']).default('answer_question'),
+              // Lenient string (not z.enum) so an off-list value can't throw
+              // AI_InvalidToolArgumentsError; anything other than 'find_object'
+              // is treated as 'answer_question' below.
+              action: z.string().default('answer_question').describe("'answer_question' to ask about the screen, or 'find_object' to locate one element and return its coordinates."),
               elementKey: elementKeyParam,
             }),
-            execute: async ({ query, action, elementKey }: { query: string, action: 'answer_question' | 'find_object', elementKey?: ElementKey }) => {
+            execute: async ({ query, action, elementKey }: { query: string, action: string, elementKey?: string }) => {
               try {
                 if (!query.trim()) {
                   return { error: true, found: false, message: 'No query provided. Call again with a clear query describing what to find/answer.' };
                 }
-                if(action === 'answer_question') {
-                  const screenshot = await deviceManager.takeScreenshot(deviceId);
-                  const analysisResult = await analyzeScreenshot(interactionTaskId, screenshot, query);
-                  return analysisResult;
-                } else if(action === 'find_object') {
+                if (action === 'find_object') {
                   const shot = await deviceManager.takeScreenshotWithDims(deviceId);
                   const findResult = await findObject(interactionTaskId, shot, query);
                   // find_object is a READ (no tap), so record tapped:false.
-                  if (findResult.found) recordToLedger(elementKey, findResult, false);
+                  if (findResult.found) recordToLedger(normalizeElementKey(elementKey), findResult, false);
                   return findResult;
                 } else {
-                  return { error: true, message: `Invalid action: ${action}. Use 'answer_question' or 'find_object'.` };
+                  // Default path: any non-'find_object' action answers a question.
+                  const screenshot = await deviceManager.takeScreenshot(deviceId);
+                  const analysisResult = await analyzeScreenshot(interactionTaskId, screenshot, query);
+                  return analysisResult;
                 }
               } catch (error) {
                 // Don't let a single flaky vision call kill the whole stage — let
@@ -431,7 +492,7 @@ export async function interactWithScreen<T>(
               query: z.string().default('').describe('Description of the element to find and tap, e.g. "the comment button (speech bubble icon on the right side)"'),
               elementKey: elementKeyParam,
             }),
-            execute: async ({ query, elementKey }: { query: string, elementKey?: ElementKey }) => {
+            execute: async ({ query, elementKey }: { query: string, elementKey?: string }) => {
               try {
                 if (!query.trim()) {
                   return { tapped: false, found: false, message: 'No element description provided. Call tap_element again with a clear query.' };
@@ -447,7 +508,7 @@ export async function interactWithScreen<T>(
                 await deviceManager.tapScreen(deviceId, coordinates.x, coordinates.y);
                 logger.info(`👆 [Interacting#${interactionTaskId}] Found and tapped "${query}" at (${coordinates.x}, ${coordinates.y})`);
                 // Record the coordinate we ACTUALLY tapped (tapped:true).
-                recordToLedger(elementKey, findResult, true);
+                recordToLedger(normalizeElementKey(elementKey), findResult, true);
                 return { tapped: true, found: true, coordinates, boundingBox: findResult.boundingBox, message: `Found and tapped ${query} at (${coordinates.x}, ${coordinates.y})` };
               } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
