@@ -25,6 +25,7 @@ export interface AutomationPresets {
     templates: string[];
     useAI: boolean;
     maxLength: number;
+    requireLanguageMatch: boolean; // only comment when the video's language matches `language`
   };
 
   // Niche-follow: grow the account by following creators in a target niche.
@@ -146,6 +147,10 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     templates: COMMENT_TEMPLATES[COMMENT_LANGUAGE] ?? COMMENT_TEMPLATES.English,
     useAI: true,
     maxLength: 50,
+    // Skip commenting when the video isn't in COMMENT_LANGUAGE (avoid e.g.
+    // writing Turkish on unrelated foreign content). Disable with
+    // COMMENT_REQUIRE_LANGUAGE_MATCH=false.
+    requireLanguageMatch: parseBool('COMMENT_REQUIRE_LANGUAGE_MATCH', true),
   },
 
   follow: {

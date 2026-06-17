@@ -55,6 +55,8 @@ export const ActionDecisionSchema = z.object({
  */
 export const CommentGenerationSchema = z.object({
   screenLooksLikeNormalFeed: z.boolean().describe('Whether the screen looks like a normal video feed? Not a shop, popup, profile page, etc.'),
+  videoLanguage: z.string().describe("Primary language of the video's speech / caption / on-screen text (e.g. Turkish, English, Spanish), or 'none' if it has no language-specific content (purely visual/music)."),
+  videoLanguageMatchesTarget: z.boolean().describe('true if the video is primarily in the TARGET comment language, OR has no language-specific content (purely visual/music); false if it is primarily in a DIFFERENT language.'),
   commentText: z.string().describe('The generated comment text, natural and engaging'),
   confidence: z.string().describe('Confidence level: high/medium/low'),
   reasoning: z.string().describe('Why this comment fits the video content'),
@@ -195,12 +197,14 @@ export class WorkingStage {
 
 **LANGUAGE: Write the comment in ${language}. Use casual, native-sounding ${language} the way real ${language} speakers comment on ${appName}. Do NOT use any other language.**
 
+**LANGUAGE MATCH (IMPORTANT): We ONLY comment on videos that are in ${language} (or have no spoken/written language at all, e.g. pure music/visuals). First detect the video's primary language from its speech, caption and on-screen text. If the video is primarily in a DIFFERENT language than ${language}, set videoLanguageMatchesTarget=false — the comment will be SKIPPED, so do not worry about its quality in that case. Set videoLanguageMatchesTarget=true only when the video is in ${language} or is language-neutral.**
+
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
 **Your workflow:**
-1. take_and_analyze_screenshot(query="Analyze this ${appName} video content: What's the main subject, mood/tone, and what type of engagement would be most appropriate?", action="answer_question")
-2. Based on the analysis, generate a contextually perfect comment in ${language}
-3. finish_task with the comment, confidence, and reasoning
+1. take_and_analyze_screenshot(query="Analyze this ${appName} video: (a) the PRIMARY language of its speech/caption/on-screen text (or 'none' if purely visual/music), and (b) the main subject, mood/tone, and what engagement fits.", action="answer_question")
+2. Set videoLanguage and videoLanguageMatchesTarget (target language is ${language}). If it matches, generate a contextually perfect comment in ${language}; if not, you may leave a short placeholder (it will be skipped).
+3. finish_task with videoLanguage, videoLanguageMatchesTarget, the comment, confidence, and reasoning
 
 **ADVANCED COMMENT STRATEGY:**
 - Match the video's energy: upbeat video = enthusiastic comment, calm video = thoughtful comment
@@ -227,6 +231,15 @@ export class WorkingStage {
               action: 'next_video',
               reason: `AI generated comment is not for a normal ${this.presets.app.feedName}, skipping`,
             }];
+          }
+          // Don't comment on videos whose language doesn't match our comment
+          // language (e.g. writing Turkish on unrelated foreign content). Skip
+          // the comment and move on; a separately-rolled like (if any) still stands.
+          if (this.presets.comments.requireLanguageMatch && !result.videoLanguageMatchesTarget) {
+            logger.info(`⏭️ [Working] Skipping comment — video language "${result.videoLanguage}" ≠ comment language "${language}"`);
+            return decisions.length > 0
+              ? decisions
+              : [{ action: 'next_video', reason: `Video language "${result.videoLanguage}" does not match comment language "${language}"` }];
           }
           const sanitizedComment = sanitizeTextForADB(result.commentText);
           // Slice by code points so a trailing emoji (surrogate pair) is never cut in half.
