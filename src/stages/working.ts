@@ -30,10 +30,29 @@ export const NicheFollowAnalysisSchema = z.object({
   screenLooksLikeNormalFeed: z.boolean().describe('true if this is a normal full-screen feed video (NOT a shop, profile page, ad, popup, DM, search, etc.)'),
   matchesNiche: z.boolean().describe('true ONLY if the video/creator is clearly about the target niche'),
   isTargetLanguage: z.boolean().describe('true ONLY if the creator/content is primarily in the target language'),
-  alreadyFollowing: z.boolean().describe('true if we ALREADY follow this creator (follow control gone / says Following / no + badge)'),
+  followButtonText: z.string().describe('The EXACT text shown on the follow button/control, copied verbatim (e.g. "Takip Et", "Takip", "Follow", "Following"). Use "" only if there is genuinely no follow button or you cannot read it.'),
+  alreadyFollowing: z.boolean().describe('true if we ALREADY follow this creator. Decide from followButtonText: "Takip Et"/"Follow" = NOT following; bare "Takip"/"Takip Ediliyor"/"Following" = already following.'),
   creatorNote: z.string().describe('short note: creator handle/username and what the video is about'),
   confidence: z.string().describe('Confidence level: high/medium/low'),
 });
+
+/**
+ * Decide follow state from the EXACT follow-button text. Handles the Turkish
+ * trap where "Takip Et" (NOT following) contains "Takip" (already following), so
+ * a naive substring check would get it backwards. Returns true = already
+ * following, false = not following, undefined = couldn't tell (trust the model).
+ */
+export function interpretFollowState(buttonText: string | undefined): boolean | undefined {
+  const t = (buttonText ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return undefined;
+  // "Already following" forms first, so "Following" isn't caught by the "follow" check.
+  if (t.includes('following') || t.includes('ediliyor')) return true;
+  // "Not following" forms — check "takip et" BEFORE the bare "takip" below.
+  if (t.includes('takip et') || /\bfollow\b/.test(t)) return false;
+  // The bare word "takip" (no "et") is Instagram's compact "already following" label.
+  if (t.includes('takip')) return true;
+  return undefined;
+}
 
 /** Result of a follow attempt. */
 export const FollowActionSchema = z.object({
@@ -170,24 +189,24 @@ export class WorkingStage {
   }
 
   /**
-   * Decide what action(s) to take based on presets and AI analysis
+   * Build the action(s) for this video. The like/comment dice are rolled by the
+   * caller (processVideo) so it can run the feed guard BEFORE we generate a
+   * comment — otherwise a recovery mid-cycle could post a comment written for the
+   * previous video onto a new one.
    */
-  async decideAction(): Promise<Array<z.infer<typeof ActionDecisionSchema>>> {
-    // Roll dice for actions based on presets
-    const likeRoll = Math.random();
-    const commentRoll = Math.random();
+  async decideAction(doLike: boolean, doComment: boolean): Promise<Array<z.infer<typeof ActionDecisionSchema>>> {
     const decisions: Array<z.infer<typeof ActionDecisionSchema>> = [];
 
     // Like decision
-    if (likeRoll < this.presets.interactions.likeChance) {
+    if (doLike) {
       decisions.push({
         action: 'like',
-        reason: `Random like roll: ${likeRoll.toFixed(3)} < ${this.presets.interactions.likeChance}`,
+        reason: `Like roll passed (chance ${this.presets.interactions.likeChance})`,
       });
     }
 
     // Comment decision
-    if (commentRoll < this.presets.interactions.commentChance) {
+    if (doComment) {
       let commentText: string;
       if (this.presets.comments.useAI) {
         try {
@@ -257,7 +276,7 @@ export class WorkingStage {
       }
       decisions.push({
         action: 'comment',
-        reason: `Random comment roll: ${commentRoll.toFixed(3)} < ${this.presets.interactions.commentChance}`,
+        reason: `Comment roll passed (chance ${this.presets.interactions.commentChance})`,
         commentText,
       });
     }
@@ -266,7 +285,7 @@ export class WorkingStage {
     if (decisions.length === 0) {
       decisions.push({
         action: 'next_video',
-        reason: `No action triggered. Like: ${likeRoll.toFixed(3)}, Comment: ${commentRoll.toFixed(3)}`,
+        reason: 'No like/comment rolled for this video',
       });
     }
 
@@ -328,16 +347,20 @@ export class WorkingStage {
         return false;
       }
 
-      // Slow phones lag through the comment flow, so wait between every action
-      // to let the UI settle. Tune with COMMENT_STEP_WAIT_S (seconds).
-      const stepWait = Number(process.env.COMMENT_STEP_WAIT_S) || 3;
+      // Split the wait budget: the long "settle" wait is only needed where the UI
+      // genuinely lags (panel/keyboard appearing, text registering, post landing);
+      // navigation taps and back-presses settle much faster. This cuts the comment
+      // flow roughly in half without truncating on a slow phone. settleWait is
+      // tuned per-device via COMMENT_STEP_WAIT_S; navWait is derived from it.
+      const settleWait = Number(process.env.COMMENT_STEP_WAIT_S) || 4;
+      const navWait = Math.max(1.5, settleWait * 0.5);
 
-      logger.info(`💬 [Working] Commenting: "${commentText}" (${stepWait}s between steps)`);
+      logger.info(`💬 [Working] Commenting: "${commentText}" (settle ${settleWait}s / nav ${navWait}s)`);
 
       // Step 1: Click comment button
       const { x: commentX, y: commentY } = this.learnedUI.commentButton;
       await this.deviceManager.tapScreen(this.deviceId, commentX, commentY);
-      await this.wait(stepWait, 'After comment button tap');
+      await this.wait(settleWait, 'After comment button tap (panel opening)');
 
       // Step 1b: Make sure the comment panel actually opened. Some videos have
       // comments turned off (the comment button is disabled and does nothing),
@@ -349,25 +372,25 @@ export class WorkingStage {
       if (!panelState.includes('OPEN')) {
         logger.warn(`⚠️ [Working] Comment panel did not open (comments likely disabled); skipping comment for this video`);
         await this.deviceManager.pressKey(this.deviceId, 'back');
-        await this.wait(stepWait, 'After dismissing closed comment panel');
+        await this.wait(navWait, 'After dismissing closed comment panel');
         return false;
       }
 
       // Step 2: Click input field
       const { x: inputX, y: inputY } = this.learnedUI.commentInputField;
       await this.deviceManager.tapScreen(this.deviceId, inputX, inputY);
-      await this.wait(stepWait, 'After input field tap (let keyboard settle)');
+      await this.wait(settleWait, 'After input field tap (let keyboard settle)');
 
       // Step 3: Type comment text
       await this.deviceManager.inputText(this.deviceId, commentText);
-      await this.wait(stepWait, 'After typing comment');
+      await this.wait(settleWait, 'After typing comment');
 
       // Confirm the comment actually shows up as a POSTED comment (not just text
       // sitting in the input box). Objective view-hierarchy check first; vision
       // yes/no only when uiautomator is unavailable (FLAG_SECURE / obfuscated /
       // virtualized list) — same signal the learning stage now uses.
       const verifyPosted = async (): Promise<boolean> => {
-        await this.wait(stepWait, 'Waiting for comment to post');
+        await this.wait(settleWait, 'Waiting for comment to post');
         const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
         const objective = verifyCommentPosted(xml, commentText);
         if (objective.usable) {
@@ -408,9 +431,9 @@ export class WorkingStage {
       // Two presses cover the "keyboard up, then panel" case; the long wait
       // between them means TikTok's double-back-to-exit can never trigger.
       await this.deviceManager.pressKey(this.deviceId, 'back');
-      await this.wait(stepWait, 'After back (close keyboard/panel)');
+      await this.wait(navWait, 'After back (close keyboard/panel)');
       await this.deviceManager.pressKey(this.deviceId, 'back');
-      await this.wait(stepWait, 'After back (close comment panel)');
+      await this.wait(navWait, 'After back (close comment panel)');
 
       if (posted) {
         this.stats.commentsPosted++;
@@ -456,16 +479,23 @@ export class WorkingStage {
     try {
       logger.info(`🔎 [Working] Niche-follow scan (niche="${follow.niche}", language=${follow.language})`);
       const analysis = await this.analyzeForNicheFollow();
+      // Prefer a deterministic read of the exact button text over the model's
+      // boolean — the model keeps misreading "Takip Et" (not following) as the
+      // bare "Takip" (already following). Fall back to the model only when the
+      // button text is unreadable.
+      const interpreted = interpretFollowState(analysis.followButtonText);
+      const alreadyFollowing = interpreted ?? analysis.alreadyFollowing;
       logger.info(
         `🔎 [Working] Follow scan: niche=${analysis.matchesNiche} lang=${analysis.isTargetLanguage} ` +
-          `alreadyFollowing=${analysis.alreadyFollowing} normalFeed=${analysis.screenLooksLikeNormalFeed} ` +
-          `(${analysis.confidence}) — ${analysis.creatorNote}`,
+          `button="${analysis.followButtonText}" alreadyFollowing=${alreadyFollowing}` +
+          `${interpreted === undefined ? ' (model)' : ' (from button text)'} ` +
+          `normalFeed=${analysis.screenLooksLikeNormalFeed} (${analysis.confidence}) — ${analysis.creatorNote}`,
       );
 
       if (!analysis.screenLooksLikeNormalFeed) return;
       if (!analysis.matchesNiche || !analysis.isTargetLanguage) return;
-      if (analysis.alreadyFollowing) {
-        logger.info(`➡️ [Working] Already following this ${follow.language} ${follow.niche.split(' ')[0]} creator; skipping`);
+      if (alreadyFollowing) {
+        logger.info(`➡️ [Working] Already following this ${follow.language} ${follow.niche.split(' ')[0]} creator (button="${analysis.followButtonText}"); skipping`);
         return;
       }
 
@@ -498,16 +528,17 @@ We follow a creator ONLY when BOTH are true:
 
 **Workflow (use take_and_analyze_screenshot with ONE query per call; do NOT tap anything — this is analysis only):**
 1. take_and_analyze_screenshot(query="Describe this ${app.displayName} video: its main topic/niche, the language of the caption / on-screen text / speech, and the creator's username/handle.", action="answer_question")
-2. take_and_analyze_screenshot(query="${app.followStateHint} Looking at the screen, are we ALREADY following this creator? Also describe the follow control you can see. ${app.followButtonHint}", action="answer_question")
+2. take_and_analyze_screenshot(query="Find the follow button/control for this creator and read its text. Report the EXACT text on it, copied letter-for-letter (for example: Takip Et, Takip, Follow, or Following).", action="answer_question")
 3. finish_task with all fields filled in.
 
 **RULES:**
 - matchesNiche = true ONLY if the video is clearly about: ${follow.niche}.
 - isTargetLanguage = true ONLY if the caption / speech / handle are primarily ${follow.language}.
+- followButtonText = the exact text you read on the follow button in step 2, copied verbatim.
 - alreadyFollowing: ${app.followStateHint}
 - When unsure, set matchesNiche / isTargetLanguage to FALSE — do NOT follow when in doubt.
 
-**STOP RULE: Call finish_task once you have looked at the video content and the follow control.**`;
+**STOP RULE: Call finish_task once you have looked at the video content and the follow button text.**`;
 
     return interactWithScreen<z.infer<typeof NicheFollowAnalysisSchema>>(
       prompt,
@@ -532,10 +563,12 @@ ${app.followButtonHint}
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
 **Steps:**
-1. tap_element(query="the follow control on this video — ${app.followButtonHint}") — tap it ONCE. Do NOT tap the avatar photo / username itself (that opens the profile page).
-2. take_and_analyze_screenshot(query="Did the follow succeed? ${app.followStateHint} State whether we are now FOLLOWING this creator, AND whether we are still on the normal full-screen video feed (not a profile page).", action="answer_question")
+1. First READ the follow control's text. ${app.followStateHint}
+   - If it already shows the ALREADY-FOLLOWING state, do NOT tap it (tapping would UNFOLLOW). Skip to step 4 with followed=true.
+   - Only if it shows the NOT-FOLLOWING state, tap_element(query="the follow button that reads the NOT-following text — ${app.followButtonHint}") ONCE. Do NOT tap the avatar photo / username (that opens the profile page).
+2. take_and_analyze_screenshot(query="Read the follow button text again now. ${app.followStateHint} Also: are we still on the normal full-screen video feed (not a profile page)?", action="answer_question")
 3. **RECOVERY — REQUIRED:** if you are NOT on the normal video feed anymore (e.g. a profile page opened, or any other screen), pressKey(keycode="back") — repeat up to twice — until you are back on the full-screen video feed. You MUST end on the feed.
-4. finish_task with followed=true ONLY if the control changed to the followed state (e.g. the + badge disappeared / it now says Following); otherwise followed=false.
+4. finish_task with followed=true ONLY if the button now shows the already-following state (it changed after your tap, OR it already was following before); otherwise followed=false.
 
 **STOP RULE: Always finish on the video feed, then call finish_task with the followed boolean.**`;
 
@@ -635,12 +668,36 @@ ${app.followButtonHint}
         }
       }
       
+      // Step 2.4: Periodic lightweight feed guard (app-tuned; e.g. Instagram
+      // every 12 videos, TikTok off). Catches drift off the feed between the
+      // rare full health checks and recovers back to the feed.
+      const { feedCheckInterval } = this.presets.app;
+      if (feedCheckInterval > 0 && this.stats.videosWatched > 0 && this.stats.videosWatched % feedCheckInterval === 0) {
+        await this.ensureOnFeedOrRecover('periodic check');
+        if (this.healthFailureExceeded) return false;
+      }
+
       // Step 2.5: Independent niche-follow scan on the clean feed, BEFORE
       // like/comment actions (which open/close panels and move the avatar).
       await this.maybeFollowCreator();
 
-      // Step 3 + 4: Decide actions and scroll to next video
-      const decisions = await this.decideAction();
+      // Step 3: Roll the dice first (cheap), then — for apps that drift (Instagram)
+      // — confirm we're on the feed BEFORE generating a comment or tapping, so we
+      // never blind-tap the wrong screen and never post a comment meant for a
+      // different video. If recovery fails, skip acting this round.
+      let doLike = Math.random() < this.presets.interactions.likeChance;
+      let doComment = Math.random() < this.presets.interactions.commentChance;
+      if (this.presets.app.guardBeforeActions && (doLike || doComment)) {
+        const onFeed = await this.ensureOnFeedOrRecover('pre-action');
+        if (!onFeed) {
+          doLike = false;
+          doComment = false;
+          if (this.healthFailureExceeded) return false;
+        }
+      }
+
+      // Step 4: Decide actions and scroll to next video
+      const decisions = await this.decideAction(doLike, doComment);
       logger.info(`🎯 [Working] Decided to do ${decisions.length} actions: ${decisions.map(d => d.action).join(', ')}`);
       for (const decision of decisions) {
         logger.info(`🎯 [Working] Action decision: ${decision.action} - ${decision.reason}`);
@@ -750,22 +807,105 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
         }
       }
 
-      if (!result.success) {
-        this.healthFailures++;
-        logger.warn(`⚠️ [Working] Health check failed (${this.healthFailures}/3)`);
-        if (this.healthFailures >= 3) {
-          logger.error(`❌ [Working] Health check failed 3 times, need to retrain UI coordinates`);
-          this.healthFailureExceeded = true;
-        }
-      } else {
-        this.healthFailures = 0;
-      }
-      
+      // NOTE: the healthFailures counter is owned by the CALLER (processVideo /
+      // ensureOnFeedOrRecover). Don't increment it here too — doing both used to
+      // double-count a single failure and trip the re-learn limit early.
       return result.success;
     } catch (error) {
       logger.error(`❌ [Working] Health check error:`, error);
       return false;
     }
+  }
+
+  /**
+   * Fast single-screenshot check: are we on the normal video feed right now?
+   * Much cheaper than performHealthCheck — used by the frequent feed guard.
+   */
+  private async isOnFeed(): Promise<boolean> {
+    const { app } = this.presets;
+    const answer = (await this.takeAndAnalyzeScreenshot(
+      `Are we on the normal ${app.displayName} ${app.feedName} RIGHT NOW — a FULL-SCREEN vertical video with like/comment icons stacked on the right side? Answer exactly "YES". ` +
+        `If instead this is the home timeline (a scrollable list/grid of photo posts), a DM/inbox/chat screen, a profile page, search, a shop, an ad, a popup, or any other screen, answer exactly "NO".`,
+    )).toUpperCase();
+    return answer.includes('YES') && !answer.includes('NO');
+  }
+
+  /**
+   * Get back to the video feed: close whatever wrong screen we're on (DM, profile,
+   * popup, home timeline…), navigate to the feed via the app's nav hint, and fall
+   * back to a cold restart if needed. Returns true only if it ends on the feed.
+   */
+  private async recoverToFeed(): Promise<boolean> {
+    const { app } = this.presets;
+    const prompt = `You are a ${app.displayName} automation agent. Get BACK to the normal ${app.feedName} (full-screen vertical video feed) as quickly as possible.
+
+**CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP (max 8 steps)!**
+
+**Flow:**
+1. take_and_analyze_screenshot(query="What screen is this? Is it the normal ${app.feedName} (full-screen vertical video with like/comment on the right)? Or the home timeline, a DM/inbox/chat, a profile page, search, a shop, an ad, or a popup?", action="answer_question")
+2. If it IS the ${app.feedName} → finish_task(recovered=true).
+3. If a DM/inbox/chat/profile/post/search/popup/ad is open → CLOSE it: pressKey(keycode="back") (or tap an X/close button), then take another screenshot.
+4. ${app.feedNavigationHint ? `Reach the feed: ${app.feedNavigationHint}` : 'Make sure the full-screen video feed is showing.'}
+5. If still not on the feed after a couple of tries → terminateApp(packageName="${app.appPackage}"), then launchApp(packageName="${app.appPackage}"), wait, then ${app.feedNavigationHint ? 'navigate to the feed as above' : 'the feed should show'}.
+6. Verify with a screenshot, then finish_task.
+
+**HARD RULES:**
+- NEVER tap random/guessed coordinates to "explore" — only use back, the navigation described above, or an app restart. Random taps open other apps and make it worse.
+- recovered=true ONLY if the FINAL screenshot clearly shows the normal ${app.feedName}.
+
+**STOP RULE: Call finish_task with recovered (true/false) after at most 8 steps.**`;
+
+    const RecoverSchema = z.object({
+      recovered: z.boolean().describe('true only if we ended on the normal video feed'),
+      note: z.string().optional().describe('short note on what was wrong / what was done'),
+    });
+
+    try {
+      const result = await interactWithScreen<z.infer<typeof RecoverSchema>>(
+        prompt,
+        this.deviceId,
+        this.deviceManager,
+        {},
+        RecoverSchema,
+      );
+      return result.recovered;
+    } catch (error) {
+      logger.warn(`⚠️ [Working] recoverToFeed failed:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Guard: confirm we're on the feed and recover if not. Feeds the shared
+   * healthFailures counter so repeated failures eventually stop the stage (and
+   * trigger a re-learn), exactly like the periodic health check.
+   */
+  private async ensureOnFeedOrRecover(context: string): Promise<boolean> {
+    // On the happy path don't touch healthFailures: this guard runs often, and
+    // zeroing here would erase failures the sparse performHealthCheck accumulated,
+    // so the re-learn threshold could never be reached. Only an EARNED recovery
+    // (we were genuinely lost and got back) clears the counter; performHealthCheck's
+    // own success path is the other reset owner.
+    if (await this.isOnFeed()) {
+      return true;
+    }
+
+    logger.warn(`⚠️ [Working] Off the ${this.presets.app.feedName} (${context}); recovering…`);
+    const recovered = await this.recoverToFeed();
+    if (recovered) {
+      logger.info(`✅ [Working] Recovered back to the ${this.presets.app.feedName}`);
+      this.healthFailures = 0;
+      return true;
+    }
+
+    this.healthFailures++;
+    const { maxHealthFailures } = this.presets.control;
+    logger.warn(`⚠️ [Working] Feed recovery failed (${this.healthFailures}/${maxHealthFailures})`);
+    if (this.healthFailures >= maxHealthFailures) {
+      logger.error(`❌ [Working] Could not get back to the ${this.presets.app.feedName} after ${maxHealthFailures} tries — stopping for a re-learn/restart`);
+      this.healthFailureExceeded = true;
+    }
+    return false;
   }
 
   /**

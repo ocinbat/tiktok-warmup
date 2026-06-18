@@ -38,6 +38,20 @@ export interface AppProfile {
    * (so the bot never re-taps an already-followed account).
    */
   followStateHint: string;
+  /**
+   * Run a lightweight "are we still on the feed?" guard every N videos and
+   * recover (navigate back to the feed, else cold-restart) if not. 0 disables
+   * the periodic guard (rely on the heavier health check). Apps that drift off
+   * the feed easily (Instagram → Home/DMs) want a small value.
+   */
+  feedCheckInterval: number;
+  /**
+   * Confirm we're on the feed right BEFORE liking/commenting, recovering first
+   * if not — so the bot never blind-taps learned coordinates on the wrong screen
+   * (e.g. hitting Instagram's DM/share icons). TikTok stays on the feed, so it
+   * leaves this off for speed.
+   */
+  guardBeforeActions: boolean;
 }
 
 export const APP_PROFILES: Record<AppId, AppProfile> = {
@@ -58,6 +72,10 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       'On TikTok the red + badge under the avatar is shown ONLY when you do NOT follow the creator. ' +
       'If the avatar has a red + under it → NOT following. If the + badge is gone (just the round avatar) → ' +
       'already following.',
+    // TikTok opens into the feed and stays there — no periodic guard, no
+    // pre-action check needed (keeps the proven-fast TikTok path unchanged).
+    feedCheckInterval: 0,
+    guardBeforeActions: false,
   },
   instagram: {
     id: 'instagram',
@@ -73,12 +91,21 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       'on the RIGHT side, and you swipe UP to move to the next video — it behaves just like the TikTok feed. ' +
       'Make sure you are on Reels before locating buttons, liking, or commenting.',
     followButtonHint:
-      'On Instagram Reels the follow control is the "Follow" / "Takip et" button shown next to the creator ' +
-      'username (near the bottom-left caption, often an outlined pill button), or a small + on the avatar in ' +
-      'the right-side column. Tap that "Follow" button — do NOT tap the username/avatar (that opens the profile).',
+      'On Instagram Reels the follow control is the small button next to the creator username (bottom-left, ' +
+      'near the caption — usually an outlined pill). To FOLLOW, tap the button that reads "Takip Et" (Turkish) ' +
+      'or "Follow" (English). NEVER tap a button reading "Takip", "Takip Ediliyor" or "Following" — that means ' +
+      'you ALREADY follow and tapping it would UNFOLLOW. Do NOT tap the username or the avatar photo (that ' +
+      'opens the profile page).',
     followStateHint:
-      'On Instagram, if the button next to the username says "Follow" / "Takip et" → NOT following. ' +
-      'If it says "Following" / "Takip ediliyor", or there is no follow button next to the username → already following.',
+      'On Instagram the follow BUTTON text tells you the state — read the WHOLE button text carefully: ' +
+      '"Takip Et" (TR) or "Follow" (EN) means you do NOT follow yet; ' +
+      'the bare word "Takip", or "Takip Ediliyor" (TR), or "Following" (EN) means you ALREADY follow. ' +
+      'TRAP: "Takip Et" CONTAINS the word "Takip", so do NOT read "Takip Et" as "Takip". The deciding signal ' +
+      'is the extra word "Et": WITH "Et" ("Takip Et") = NOT following; the bare "Takip" (no "Et") = already following.',
+    // Instagram drifts off Reels easily (Home timeline, DMs, profiles), so guard
+    // before every like/comment AND check periodically to recover fast.
+    feedCheckInterval: 12,
+    guardBeforeActions: true,
   },
 };
 

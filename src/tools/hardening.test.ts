@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { interpretFollowState } from '../stages/working.js';
+
 import { ElementLedger } from './ElementLedger.js';
 import { normalizeForMatch, parseNodes, verifyCommentPosted } from './uiVerify.js';
 import { readPngDimensions } from './utils.js';
@@ -162,5 +164,28 @@ describe('ElementLedger', () => {
     expect(ledger.likeVerified).toBe(true);
     expect(ledger.commentVerified).toBe(false);
     expect(ledger.getBest('likeButton')).toMatchObject({ x: 980, y: 1260 });
+  });
+});
+
+describe('interpretFollowState', () => {
+  it('treats "Takip Et" / "Follow" as NOT following', () => {
+    expect(interpretFollowState('Takip Et')).toBe(false);
+    expect(interpretFollowState('takip et')).toBe(false);
+    expect(interpretFollowState('  Takip  Et ')).toBe(false);
+    expect(interpretFollowState('Follow')).toBe(false);
+  });
+
+  it('treats the bare "Takip" / "Following" / "Takip Ediliyor" as already following', () => {
+    // The trap: "Takip" is a substring of "Takip Et" — bare "Takip" must read as following.
+    expect(interpretFollowState('Takip')).toBe(true);
+    expect(interpretFollowState('takip')).toBe(true);
+    expect(interpretFollowState('Takip Ediliyor')).toBe(true);
+    expect(interpretFollowState('Following')).toBe(true);
+  });
+
+  it('returns undefined when the text is empty or unrecognized', () => {
+    expect(interpretFollowState('')).toBeUndefined();
+    expect(interpretFollowState(undefined)).toBeUndefined();
+    expect(interpretFollowState('Mesaj Gönder')).toBeUndefined();
   });
 });

@@ -70,6 +70,8 @@ export class Worker {
   private currentStage: WorkerStage = 'initiating';
   private learnedUI: LearnedUIElements = {};
   private deviceManager: DeviceManager;
+  /** Set by shutdown() so the working-stage recovery loop stops cleanly. */
+  private isStopping = false;
 
   constructor(config: WorkerConfig) {
     this.deviceId = config.deviceId;
@@ -266,13 +268,14 @@ export class Worker {
    */
   async shutdown(): Promise<void> {
     logger.info(`🛑 Shutting down worker for ${this.deviceName}...`);
-    
+
     try {
+      // Signal the working-stage recovery loop to stop resuming.
+      this.isStopping = true;
       // TODO: Add cleanup:
-      // - Stop any running automation
       // - Save state
       // - Release device resources
-      
+
       this.isInitialized = false;
       logger.info(`✅ Worker shutdown completed for ${this.deviceName}`);
       
@@ -358,15 +361,54 @@ export class Worker {
         logger.info(`✅ [Worker] Working stage completed for ${this.deviceName}: ${result.message}`);
         return true;
       } else {
+        // Don't force 'error' here: a failed run is usually recoverable. The
+        // caller (runWorkingWithRecovery) owns the stage — it resets to 'working'
+        // for a retry and only marks 'error' when it finally gives up.
         logger.error(`❌ [Worker] Working stage failed for ${this.deviceName}: ${result.message}`);
-        this.currentStage = 'error';
         return false;
       }
-      
+
     } catch (error) {
       logger.error(`❌ [Worker] Working stage error for ${this.deviceName}:`, error);
-      this.currentStage = 'error';
       return false;
+    }
+  }
+
+  /**
+   * Run the working stage with auto-recovery. A single working-stage stop used
+   * to end the whole pipeline, leaving the bot frozen on one screen. Now, when
+   * the stage stops because of feed/health trouble (it returns false), we cold-
+   * restart the app and resume — backing off and eventually giving up only after
+   * several consecutive failed resumes (e.g. genuinely bad learned coordinates).
+   * A clean finish (daily limit reached → returns true) ends the pipeline.
+   */
+  async runWorkingWithRecovery(): Promise<void> {
+    const MAX_CONSECUTIVE_FAILURES = 5;
+    let consecutiveFailures = 0;
+
+    while (!this.isStopping) {
+      const ok = await this.runWorkingStage();
+      if (ok) {
+        logger.info(`🏁 [Worker] Working stage finished normally for ${this.deviceName}`);
+        return;
+      }
+      if (this.isStopping) return;
+
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        logger.error(`❌ [Worker] Working stage failed ${MAX_CONSECUTIVE_FAILURES}× in a row for ${this.deviceName} — giving up. If this persists, delete data/learned-ui-data.json to re-learn.`);
+        this.currentStage = 'error';
+        return;
+      }
+
+      const backoffS = Math.min(60, 10 * consecutiveFailures);
+      logger.warn(`♻️ [Worker] Working stage stopped for ${this.deviceName}; cold-restarting ${this.presets.app.displayName} and resuming (attempt ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}, ${backoffS}s backoff)…`);
+      await new Promise((res) => setTimeout(res, backoffS * 1000));
+      if (this.isStopping) return;
+      // Cold restart lands us back on a clean feed; the next working run's
+      // ensureAppReady() then re-confirms before automating.
+      await this.runInitiatingStage();
+      this.currentStage = 'working';
     }
   }
 
@@ -426,10 +468,10 @@ export class Worker {
         this.currentStage = 'working';
       }
 
-      // Step 3: Working Stage 
+      // Step 3: Working Stage (with auto-recovery so a stop doesn't freeze the bot)
       if (this.currentStage === 'working') {
         logger.info(`📱 ${this.deviceName} ready for automation with learned UI:`, this.learnedUI);
-        await this.runWorkingStage();
+        await this.runWorkingWithRecovery();
       }
 
     } catch (error) {

@@ -88,6 +88,13 @@ const ELEMENT_KEY_SET: ReadonlySet<string> = new Set(ELEMENT_KEYS);
 const normalizeElementKey = (value: unknown): ElementKey | undefined =>
   typeof value === 'string' && ELEMENT_KEY_SET.has(value) ? (value as ElementKey) : undefined;
 
+/**
+ * Normalize a tool/argument name for fuzzy matching: lowercase and drop
+ * underscores. Lets us map a local model's snake_case guesses (terminate_app,
+ * package_name) to the real camelCase tool/arg (terminateApp, packageName).
+ */
+const normalizeName = (s: string): string => s.toLowerCase().replace(/_/g, '');
+
 /** Best-effort shape hint for a Zod object schema, used in the JSON fallback prompt. */
 const describeSchemaShape = (schema: z.ZodTypeAny): string => {
   if (schema instanceof z.ZodObject) {
@@ -411,30 +418,53 @@ export async function interactWithScreen<T>(
      * there's nothing safe to strip (or the tool itself is unknown), give up
      * (return null) and let the original error surface.
      */
-    const repairToolCall: ToolCallRepairFunction<ToolSet> = async ({ toolCall, parameterSchema, error }) => {
+    const repairToolCall: ToolCallRepairFunction<ToolSet> = async ({ toolCall, tools, parameterSchema, error }) => {
+      // 1) Resolve the intended tool. Local models often call a snake_case name
+      // (terminate_app) for a camelCase tool (terminateApp), or invent a name.
+      // Map it to the real tool by normalized name; give up only if no match.
+      let { toolName } = toolCall;
       if (NoSuchToolError.isInstance(error)) {
-        logger.warn(`[Interacting#${interactionTaskId}] Model called unknown tool "${toolCall.toolName}" — cannot repair.`);
-        return null;
+        const want = normalizeName(toolName);
+        const match = Object.keys(tools).find((real) => normalizeName(real) === want);
+        if (!match) {
+          logger.warn(`[Interacting#${interactionTaskId}] Unknown tool "${toolName}" with no close match — cannot repair.`);
+          return null;
+        }
+        logger.warn(`[Interacting#${interactionTaskId}] Remapping unknown tool "${toolName}" → "${match}".`);
+        toolName = match;
       }
+
+      // 2) Reconcile args against the (possibly remapped) tool's schema: rename
+      // snake_case keys to the real property (package_name → packageName) and
+      // drop genuinely-unknown ones, so the corrected call passes validation.
       let parsed: unknown;
       try {
-        parsed = JSON.parse(toolCall.args);
+        parsed = JSON.parse(toolCall.args || '{}');
       } catch {
-        return null;
+        parsed = {};
       }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-      const schema = parameterSchema({ toolName: toolCall.toolName }) as { properties?: Record<string, unknown> } | undefined;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) parsed = {};
+
+      const schema = parameterSchema({ toolName }) as { properties?: Record<string, unknown> } | undefined;
       const allowed = schema?.properties;
-      if (!allowed) return null;
-      const cleaned: Record<string, unknown> = {};
-      const dropped: string[] = [];
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (key in allowed) cleaned[key] = value;
-        else dropped.push(key);
+      let cleaned = parsed as Record<string, unknown>;
+      let argsChanged = false;
+
+      if (allowed) {
+        const byNorm = new Map(Object.keys(allowed).map((p) => [normalizeName(p), p]));
+        const next: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          if (key in allowed) { next[key] = value; continue; }
+          const real = byNorm.get(normalizeName(key));
+          if (real) { next[real] = value; argsChanged = true; } // snake_case → real prop
+          else { argsChanged = true; }                          // drop unknown key
+        }
+        cleaned = next;
       }
-      if (dropped.length === 0) return null; // nothing we know how to fix
-      logger.warn(`[Interacting#${interactionTaskId}] Repairing ${toolCall.toolName} call: dropped unknown arg(s) ${dropped.join(', ')}.`);
-      return { ...toolCall, args: JSON.stringify(cleaned) };
+
+      const nameChanged = toolName !== toolCall.toolName;
+      if (!nameChanged && !argsChanged) return null; // nothing we can improve
+      return { ...toolCall, toolName, args: JSON.stringify(cleaned) };
     };
 
     await generateText({
