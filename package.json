@@ -24,6 +24,7 @@
     "dev": "tsx src/index.ts --debug",
     "start": "tsx src/index.ts",
     "test-scan": "tsx src/index.ts --help",
+    "test-follow": "tsx src/scripts/test-follow.ts",
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
