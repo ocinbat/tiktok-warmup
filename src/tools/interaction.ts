@@ -1,10 +1,11 @@
 /* eslint-disable no-duplicate-imports */
 import type { ModelMessage, ToolCallRepairFunction, ToolSet } from "ai";
 import { generateObject, generateText, hasToolCall, NoSuchToolError, stepCountIs } from "ai";
+import sharp from "sharp";
 import { z } from "zod";
 
 import { ELEMENT_KEYS, type ElementKey, type ElementLedger } from "./ElementLedger.js";
-import { getThinkingProviderOptions, llm, visionLlm } from "./llm.js";
+import { ACTIVE_PROVIDER, getThinkingProviderOptions, llm, VISION_PROVIDER, visionLlm } from "./llm.js";
 import { verifyCommentPosted } from "./uiVerify.js";
 import { logger, uuidv4 } from "./utils.js";
 
@@ -42,13 +43,42 @@ interface Screenshot {
 const AGENT_MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 40;
 
 /**
+ * Providers that speak the Anthropic-style API, where max_tokens is MANDATORY
+ * and @ai-sdk/anthropic silently fills in 4096 — tight enough that a long
+ * reasoning answer gets cut off before its tool call / JSON. These get an
+ * explicit, roomier default cap instead of "unset = no cap".
+ */
+const ANTHROPIC_STYLE_PROVIDERS: ReadonlySet<string> = new Set(['minimax', 'anthropic']);
+
+/** Positive-integer env parse; anything else (unset, 0, garbage) → fallback. */
+const parseTokenCap = (name: string, fallback: number | undefined): number | undefined => {
+  const parsed = Number(process.env[name]);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : fallback;
+};
+
+/**
  * Optional hard cap on tokens generated per agent step. Unset = no cap (the
  * default for cloud models like Gemini). Set AGENT_MAX_OUTPUT_TOKENS (e.g. 4096)
  * to rein in a verbose local reasoning model that burns 15-20k reasoning tokens
  * per call. WARNING: setting it too low can cut a reasoning model off before it
  * emits its tool call — keep it generous (>= 2048).
+ * On Anthropic-style providers (MiniMax, Claude) "unset" defaults to 8192, not
+ * no-cap — see ANTHROPIC_STYLE_PROVIDERS.
  */
-const AGENT_MAX_OUTPUT_TOKENS = Number(process.env.AGENT_MAX_OUTPUT_TOKENS) || undefined;
+const AGENT_MAX_OUTPUT_TOKENS = parseTokenCap(
+  'AGENT_MAX_OUTPUT_TOKENS',
+  ANTHROPIC_STYLE_PROVIDERS.has(ACTIVE_PROVIDER) ? 8192 : undefined,
+);
+
+/**
+ * Same idea for the vision sub-calls (generateStructured). These return small
+ * JSON objects, but MiniMax M3 sometimes precedes them with prose/reasoning, so
+ * the anthropic provider's silent 4096 default can truncate the JSON mid-object.
+ */
+const VISION_MAX_OUTPUT_TOKENS = parseTokenCap(
+  'VISION_MAX_OUTPUT_TOKENS',
+  ANTHROPIC_STYLE_PROVIDERS.has(VISION_PROVIDER) ? 8192 : undefined,
+);
 
 /**
  * Order of the 4 numbers a vision model returns for a bounding box.
@@ -57,7 +87,24 @@ const AGENT_MAX_OUTPUT_TOKENS = Number(process.env.AGENT_MAX_OUTPUT_TOKENS) || u
  * Set VISION_BOX_ORDER=xyxy for those. A wrong order swaps X and Y, so taps land
  * in the wrong place (e.g. opening the camera instead of liking).
  */
-const VISION_BOX_XY_FIRST = process.env.VISION_BOX_ORDER?.trim().toLowerCase() === 'xyxy';
+export const VISION_BOX_XY_FIRST = process.env.VISION_BOX_ORDER?.trim().toLowerCase() === 'xyxy';
+
+/**
+ * Two-stage "crop-zoom" coordinate refinement. Stage 1 finds a coarse box on
+ * the full screenshot; stage 2 re-detects on a crop centered on that box —
+ * where the element is ~2-3x larger — and maps the result back.
+ *
+ * WHY: measured on MiniMax-M3 (src/scripts/bench-vision.ts), full-screen
+ * detections carry a consistent ~+8-10% downward y-bias that repeating the
+ * call and taking a median does NOT fix (it is bias, not noise), while
+ * crop-zoom collapses the mean |y error| ~15x (76 → 5 normalized; tap hit
+ * rate 6% → 67% on the bench) at the cost of one extra vision call.
+ * Defaults ON for MiniMax, OFF elsewhere (Gemini's grounding doesn't need
+ * it). Override with VISION_ZOOM_REFINE=true/false.
+ */
+const VISION_ZOOM_REFINE = process.env.VISION_ZOOM_REFINE
+  ? process.env.VISION_ZOOM_REFINE.trim().toLowerCase() === 'true'
+  : VISION_PROVIDER === 'minimax';
 
 /** True for the AI SDK error thrown when the model returns no parseable object. */
 const isNoObjectGenerated = (error: unknown): boolean =>
@@ -130,7 +177,7 @@ const extractJsonObject = (text: string): string => {
  * schema. Providers that already return clean objects (e.g. Gemini) never reach
  * the fallback, so their behavior is unchanged.
  */
-async function generateStructured<T>(params: {
+export async function generateStructured<T>(params: {
   messages: ModelMessage[];
   // Input decoupled from output so schemas using .default() infer T as the output type.
   schema: z.ZodType<T, z.ZodTypeDef, unknown>;
@@ -147,12 +194,22 @@ async function generateStructured<T>(params: {
       schema: schema as z.ZodType<unknown>,
       schemaName,
       schemaDescription,
+      maxOutputTokens: VISION_MAX_OUTPUT_TOKENS,
     });
     return result.object as T;
   } catch (error) {
     if (!isNoObjectGenerated(error) && !isUnsupportedResponseFormat(error)) throw error;
 
-    logger.warn(`⚠️ Structured output failed (${isUnsupportedResponseFormat(error) ? 'response_format rejected' : 'no object'}); falling back to text+JSON parse (${schemaName ?? 'object'})`);
+    // NoObjectGeneratedError carries the finishReason; 'length' means the
+    // answer was cut off by the output-token cap, not that the model refused
+    // to produce an object — tell the operator which knob to turn.
+    const truncated = (error as { finishReason?: string }).finishReason === 'length';
+    const cause = isUnsupportedResponseFormat(error)
+      ? 'response_format rejected'
+      : truncated
+        ? `truncated at the ${VISION_MAX_OUTPUT_TOKENS ?? 'provider default'} output-token cap — consider raising VISION_MAX_OUTPUT_TOKENS`
+        : 'no object';
+    logger.warn(`⚠️ Structured output failed (${cause}); falling back to text+JSON parse (${schemaName ?? 'object'})`);
     const jsonInstruction =
       `Respond with ONLY a single valid JSON object and nothing else — no prose, no explanation, ` +
       `no markdown code fences. The JSON must match this shape:\n${describeSchemaShape(schema)}`;
@@ -171,7 +228,14 @@ async function generateStructured<T>(params: {
       { role: 'system', content: systemParts.join('\n\n') },
       ...otherMessages,
     ];
-    const { text } = await generateText({ model: visionLlm, messages: fallbackMessages });
+    const { text, finishReason } = await generateText({
+      model: visionLlm,
+      messages: fallbackMessages,
+      maxOutputTokens: VISION_MAX_OUTPUT_TOKENS,
+    });
+    if (finishReason === 'length') {
+      logger.warn(`⚠️ JSON fallback also hit the ${VISION_MAX_OUTPUT_TOKENS ?? 'provider default'} output-token cap — raise VISION_MAX_OUTPUT_TOKENS if the parse below fails`);
+    }
     const parsed: unknown = JSON.parse(extractJsonObject(text));
     return schema.parse(parsed);
   }
@@ -256,17 +320,13 @@ const analyzeScreenshot = async (taskId: string, screenshot: string, query: stri
   return analysisResult;
 };
 
-const findObject = async (taskId: string, shot: Screenshot, query: string) => {
-    logger.info(`🔍 [Interacting#${taskId}] Finding object: ${query}`);
-
-    // The screenshot's own dimensions ARE the tap coordinate space.
-    const { base64Data, width: imgWidth, height: imgHeight } = shot;
-
-    const detection = await generateStructured({
-      messages: [
-        {
-          role: 'system',
-          content: `
+/**
+ * The exact prompt + schema findObject sends, exported as one bundle so the
+ * calibration script (src/scripts/test-provider.ts) tests the REAL production
+ * request — never a drifted copy.
+ */
+export const FIND_OBJECT_CALL = {
+  systemPrompt: `
           You are a visual LLM for object detection and spatial understanding.
           Return bounding box coordinates in format [y1, x1, y2, x2] normalized to 0-1000.
           Where y1,y2 are top/bottom coordinates and x1,x2 are left/right coordinates.
@@ -275,83 +335,181 @@ const findObject = async (taskId: string, shot: Screenshot, query: string) => {
           If object is found, return box_2d coordinates and descriptive label.
           If object is NOT found, set found=false and explain why in another_response field.
           `,
-        },
-        {
-          role: 'user',
-          content: [{
-            type: 'text',
-            text: query,
-          },{
-            type: 'image',
-            image: `data:image/png;base64,${base64Data}`,
-          }],
-        },
-      ],
-      schema: z.object({
-        found: z.boolean().describe('Whether the requested object was found'),
-        box_2d: z.array(z.number()).default([]).describe('Bounding box coordinates [y1, x1, y2, x2] normalized to 0-1000, required if found=true, omit/empty if not found'),
-        label: z.string().default('').describe('Descriptive label of the found object, empty if not found'),
-        another_response: z.string().optional().describe('Explanation if object not found or additional context'),
-      }),
-      schemaName: 'detection_result',
-      schemaDescription: 'Object detection result with normalized coordinates',
-    });
+  schema: z.object({
+    found: z.boolean().describe('Whether the requested object was found'),
+    box_2d: z.array(z.number()).default([]).describe('Bounding box coordinates [y1, x1, y2, x2] normalized to 0-1000, required if found=true, omit/empty if not found'),
+    label: z.string().default('').describe('Descriptive label of the found object, empty if not found'),
+    another_response: z.string().optional().describe('Explanation if object not found or additional context'),
+  }),
+  schemaName: 'detection_result',
+  schemaDescription: 'Object detection result with normalized coordinates',
+} as const;
 
+/** One raw detection pass over an image: named-edge box normalized to 0-1000. */
+const detectNormalizedBox = async (
+  imageBase64: string,
+  query: string,
+): Promise<
+  | { found: true; y1: number; x1: number; y2: number; x2: number; label: string }
+  | { found: false; reason?: string }
+> => {
+  const detection = await generateStructured({
+    messages: [
+      {
+        role: 'system',
+        content: FIND_OBJECT_CALL.systemPrompt,
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: query,
+        },{
+          type: 'image',
+          image: `data:image/png;base64,${imageBase64}`,
+        }],
+      },
+    ],
+    schema: FIND_OBJECT_CALL.schema,
+    schemaName: FIND_OBJECT_CALL.schemaName,
+    schemaDescription: FIND_OBJECT_CALL.schemaDescription,
+  });
+  if (!detection.found || detection.box_2d.length !== 4) {
+    return { found: false, reason: detection.another_response };
+  }
+  const [a, b, c, d] = detection.box_2d;
+  // Map the 4 numbers to named edges according to the model's convention.
+  const edges = VISION_BOX_XY_FIRST
+    ? { x1: a, y1: b, x2: c, y2: d }
+    : { y1: a, x1: b, y2: c, x2: d };
+  return { found: true, ...edges, label: detection.label };
+};
+
+/**
+ * Crop window for the zoom stage. It must comfortably contain the true element
+ * despite stage 1's error (measured up to ~18% of screen height downward on
+ * MiniMax-M3) while still magnifying it substantially: 55% x 35% gives ~1.8x
+ * zoom in x and ~2.9x in y on a phone screen.
+ */
+const ZOOM_CROP_WIDTH_FRACTION = 0.55;
+const ZOOM_CROP_HEIGHT_FRACTION = 0.35;
+
+/**
+ * Stage 2 of coordinate detection (see VISION_ZOOM_REFINE): re-detect the
+ * element on a crop centered on stage 1's answer, map the box back to
+ * full-image pixels. Returns null on ANY failure so the caller keeps the
+ * stage-1 result — this stage can only refine, never lose a detection.
+ */
+const zoomRefine = async (
+  taskId: string,
+  shot: Screenshot,
+  query: string,
+  coarseCenter: { x: number; y: number },
+): Promise<{ boundingBox: { y1: number; x1: number; y2: number; x2: number }; centerX: number; centerY: number; label: string } | null> => {
+  try {
+    const cropWidth = Math.min(shot.width, Math.round(shot.width * ZOOM_CROP_WIDTH_FRACTION));
+    const cropHeight = Math.min(shot.height, Math.round(shot.height * ZOOM_CROP_HEIGHT_FRACTION));
+    const left = Math.min(Math.max(Math.round(coarseCenter.x - cropWidth / 2), 0), shot.width - cropWidth);
+    const top = Math.min(Math.max(Math.round(coarseCenter.y - cropHeight / 2), 0), shot.height - cropHeight);
+    const cropped = await sharp(Buffer.from(shot.base64Data, 'base64'))
+      .extract({ left, top, width: cropWidth, height: cropHeight })
+      .png()
+      .toBuffer();
+    const refined = await detectNormalizedBox(
+      cropped.toString('base64'),
+      `${query} (this is a zoomed-in crop of the screen)`,
+    );
+    if (!refined.found) {
+      logger.warn(`🔍 [Interacting#${taskId}] Zoom refine did not re-find the element; keeping the coarse detection`);
+      return null;
+    }
+    const boundingBox = {
+      y1: top + Math.round((refined.y1 / 1000) * cropHeight),
+      x1: left + Math.round((refined.x1 / 1000) * cropWidth),
+      y2: top + Math.round((refined.y2 / 1000) * cropHeight),
+      x2: left + Math.round((refined.x2 / 1000) * cropWidth),
+    };
+    return {
+      boundingBox,
+      centerX: Math.round((boundingBox.x1 + boundingBox.x2) / 2),
+      centerY: Math.round((boundingBox.y1 + boundingBox.y2) / 2),
+      label: refined.label,
+    };
+  } catch (error) {
+    logger.warn(`🔍 [Interacting#${taskId}] Zoom refine failed (${error instanceof Error ? error.message : String(error)}); keeping the coarse detection`);
+    return null;
+  }
+};
+
+export const findObject = async (taskId: string, shot: Screenshot, query: string) => {
+    logger.info(`🔍 [Interacting#${taskId}] Finding object: ${query}`);
+
+    // The screenshot's own dimensions ARE the tap coordinate space.
+    const { width: imgWidth, height: imgHeight } = shot;
+
+    const detection = await detectNormalizedBox(shot.base64Data, query);
     logger.info(`🔍 [Interacting#${taskId}] Detection result:`, detection);
 
-    // Process and return structured result
-    if (detection.found && detection.box_2d.length === 4) {
-      const [a, b, c, d] = detection.box_2d;
-      // Map the 4 numbers to named edges according to the model's convention.
-      const { y1, x1, y2, x2 } = VISION_BOX_XY_FIRST
-        ? { x1: a, y1: b, x2: c, y2: d }
-        : { y1: a, x1: b, y2: c, x2: d };
-
-      // Convert normalized coordinates to pixel coordinates (image == tap space)
-      const pixelCoords = convertToPixelCoordinates({ y1, x1, y2, x2 }, imgWidth, imgHeight);
-      const boundingBox = { y1: pixelCoords.y1, x1: pixelCoords.x1, y2: pixelCoords.y2, x2: pixelCoords.x2 };
-
-      // Reject a detection that landed outside the screenshot — that is a
-      // misdetection, and tapping it would hit a random edge control. The caller
-      // treats this like "not found" and the agent retries.
-      if (pixelCoords.outOfBounds) {
-        logger.warn(`🔍 [Interacting#${taskId}] Detection out of bounds (${pixelCoords.centerX}, ${pixelCoords.centerY}) for ${imgWidth}x${imgHeight}; rejecting: ${query}`);
-        return {
-          found: false,
-          outOfBounds: true,
-          message: `Detected "${detection.label}" at (${pixelCoords.centerX}, ${pixelCoords.centerY}) which is OUTSIDE the ${imgWidth}x${imgHeight} screen — almost certainly a misdetection. Take a fresh screenshot and try a more specific description.`,
-          suggestion: 'Take another screenshot and retry with a more specific description.',
-          coordinates: null,
-          boundingBox: null,
-        };
-      }
-
-      return {
-        found: true,
-        outOfBounds: false,
-        coordinates: {
-          // Real pixel coordinates for clicking
-          x: pixelCoords.centerX,
-          y: pixelCoords.centerY
-        },
-        boundingBox, // Pixel coordinates
-        label: detection.label,
-        confidence: deriveConfidence(boundingBox, imgWidth, imgHeight),
-        imgWidth,
-        imgHeight,
-        message: `Found ${detection.label} at pixel coordinates (${pixelCoords.centerX}, ${pixelCoords.centerY})`
-      };
-    } else {
+    if (!detection.found) {
       logger.info(`🔍 [Interacting#${taskId}] Object not found: ${query}`);
       return {
         found: false,
         outOfBounds: false,
-        message: detection.another_response ?? `Object not found: ${query}`,
+        message: detection.reason ?? `Object not found: ${query}`,
         suggestion: "Try taking another screenshot or look for similar UI elements",
         coordinates: null,
         boundingBox: null
       };
     }
+
+    // Convert normalized coordinates to pixel coordinates (image == tap space)
+    const pixelCoords = convertToPixelCoordinates(detection, imgWidth, imgHeight);
+    let boundingBox = { y1: pixelCoords.y1, x1: pixelCoords.x1, y2: pixelCoords.y2, x2: pixelCoords.x2 };
+    let { centerX, centerY, outOfBounds } = pixelCoords;
+    let { label } = detection;
+
+    // Stage 2: crop-zoom refinement (see VISION_ZOOM_REFINE). Falls back to
+    // the coarse stage-1 result if the element isn't re-found on the crop.
+    if (VISION_ZOOM_REFINE && !outOfBounds) {
+      const refined = await zoomRefine(taskId, shot, query, { x: centerX, y: centerY });
+      if (refined) {
+        ({ boundingBox, centerX, centerY } = refined);
+        label = refined.label || label;
+        outOfBounds = centerX < 0 || centerY < 0 || centerX >= imgWidth || centerY >= imgHeight;
+        logger.info(`🔍 [Interacting#${taskId}] Zoom refined center: (${pixelCoords.centerX}, ${pixelCoords.centerY}) -> (${centerX}, ${centerY})`);
+      }
+    }
+
+    // Reject a detection that landed outside the screenshot — that is a
+    // misdetection, and tapping it would hit a random edge control. The caller
+    // treats this like "not found" and the agent retries.
+    if (outOfBounds) {
+      logger.warn(`🔍 [Interacting#${taskId}] Detection out of bounds (${centerX}, ${centerY}) for ${imgWidth}x${imgHeight}; rejecting: ${query}`);
+      return {
+        found: false,
+        outOfBounds: true,
+        message: `Detected "${label}" at (${centerX}, ${centerY}) which is OUTSIDE the ${imgWidth}x${imgHeight} screen — almost certainly a misdetection. Take a fresh screenshot and try a more specific description.`,
+        suggestion: 'Take another screenshot and retry with a more specific description.',
+        coordinates: null,
+        boundingBox: null,
+      };
+    }
+
+    return {
+      found: true,
+      outOfBounds: false,
+      coordinates: {
+        // Real pixel coordinates for clicking
+        x: centerX,
+        y: centerY
+      },
+      boundingBox, // Pixel coordinates
+      label,
+      confidence: deriveConfidence(boundingBox, imgWidth, imgHeight),
+      imgWidth,
+      imgHeight,
+      message: `Found ${label} at pixel coordinates (${centerX}, ${centerY})`
+    };
   }
 
 export async function interactWithScreen<T>(
@@ -467,7 +625,7 @@ export async function interactWithScreen<T>(
       return { ...toolCall, toolName, args: JSON.stringify(cleaned) };
     };
 
-    await generateText({
+    const agentRun = await generateText({
         model: llm,
         prompt,
         providerOptions: getThinkingProviderOptions(),
@@ -713,11 +871,16 @@ export async function interactWithScreen<T>(
     // generateText resolves when stopWhen is met. If the agent ran out of steps
     // without calling finish_task, the result was never captured — fail loudly
     // instead of leaving the caller's promise unsettled (which silently exits
-    // the process with code 13).
+    // the process with code 13). Distinguish real step exhaustion from a step
+    // that hit the output-token cap mid-reasoning (finishReason 'length'): the
+    // fixes are different knobs.
     if (!finished) {
+      const stepsUsed = agentRun.steps.length;
+      const remedy = agentRun.finishReason === 'length'
+        ? `The last step was cut off by the ${AGENT_MAX_OUTPUT_TOKENS ?? 'provider default'} output-token cap before it could emit a tool call — raise AGENT_MAX_OUTPUT_TOKENS.`
+        : 'Raise AGENT_MAX_STEPS if the task legitimately needs more steps.';
       throw new Error(
-        `[Interacting#${interactionTaskId}] Agent stopped after ${AGENT_MAX_STEPS} steps without calling finish_task. ` +
-        `Raise AGENT_MAX_STEPS if the task legitimately needs more steps.`,
+        `[Interacting#${interactionTaskId}] Agent stopped after ${stepsUsed}/${AGENT_MAX_STEPS} steps without calling finish_task (last step finishReason: ${agentRun.finishReason}). ${remedy}`,
       );
     }
     return capturedResult as T;

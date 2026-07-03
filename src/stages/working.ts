@@ -461,11 +461,9 @@ export class WorkingStage {
    */
   async maybeFollowCreator(): Promise<void> {
     const { follow, app } = this.presets;
-    // Disabled, or this app has no follow control configured.
+    // Disabled, or this app has no follow control configured. (The decision of
+    // WHEN to scan — per-video chance or on-like — is made by the caller.)
     if (!follow.enabled || !app.followButtonHint) return;
-
-    // Independent per-video probability — most videos are never scanned.
-    if (Math.random() >= follow.chance) return;
 
     // Safety cap for the session.
     if (this.stats.followsGiven >= follow.dailyLimit) {
@@ -677,16 +675,15 @@ ${app.followButtonHint}
         if (this.healthFailureExceeded) return false;
       }
 
-      // Step 2.5: Independent niche-follow scan on the clean feed, BEFORE
-      // like/comment actions (which open/close panels and move the avatar).
-      await this.maybeFollowCreator();
-
-      // Step 3: Roll the dice first (cheap), then — for apps that drift (Instagram)
-      // — confirm we're on the feed BEFORE generating a comment or tapping, so we
-      // never blind-tap the wrong screen and never post a comment meant for a
-      // different video. If recovery fails, skip acting this round.
+      // Step 3: Roll the like/comment dice first (cheap). We need doLike BEFORE the
+      // follow decision so we can also follow-scan every video we LIKE.
       let doLike = Math.random() < this.presets.interactions.likeChance;
       let doComment = Math.random() < this.presets.interactions.commentChance;
+
+      // Step 3b: For apps that drift (Instagram), confirm we're on the feed BEFORE
+      // comment generation, tapping, or a follow scan — so we never blind-tap the
+      // wrong screen and never post a comment meant for a different video. If
+      // recovery fails, skip acting this round.
       if (this.presets.app.guardBeforeActions && (doLike || doComment)) {
         const onFeed = await this.ensureOnFeedOrRecover('pre-action');
         if (!onFeed) {
@@ -694,6 +691,15 @@ ${app.followButtonHint}
           doComment = false;
           if (this.healthFailureExceeded) return false;
         }
+      }
+
+      // Step 3c: Niche-follow scan on the clean feed (BEFORE like/comment, which
+      // open/close panels and move the avatar). Triggered by the independent
+      // per-video probability OR — when enabled — on every video we LIKE, so an
+      // engaged video always gets a follow check.
+      const { follow } = this.presets;
+      if (follow.enabled && (Math.random() < follow.chance || (doLike && follow.scanOnLike))) {
+        await this.maybeFollowCreator();
       }
 
       // Step 4: Decide actions and scroll to next video

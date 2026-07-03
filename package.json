@@ -25,6 +25,7 @@
     "start": "tsx src/index.ts",
     "test-scan": "tsx src/index.ts --help",
     "test-follow": "tsx src/scripts/test-follow.ts",
+    "test-provider": "tsx src/scripts/test-provider.ts",
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -71,6 +72,7 @@
     "@ai-sdk/openai-compatible": "1.0.0-alpha.8",
     "ai": "5.0.0-alpha.8",
     "dotenv": "^16.5.0",
+    "sharp": "^0.35.3",
     "zod": "^3.25.51"
   }
 }

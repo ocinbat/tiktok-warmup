@@ -29,12 +29,13 @@ export interface AutomationPresets {
   };
 
   // Niche-follow: grow the account by following creators in a target niche.
-  // Independent of like/comment — its own per-video scan probability.
+  // Scans a video either on its own probability OR whenever we like that video.
   follow: {
     enabled: boolean;       // master switch (FOLLOW_ENABLED)
     niche: string;          // topic to match, e.g. skincare (FOLLOW_NICHE)
     language: string;       // creator language to match, e.g. Turkish (FOLLOW_LANGUAGE)
     chance: number;         // 0-1 per-video probability of running a follow scan (FOLLOW_CHANCE)
+    scanOnLike: boolean;    // also run a follow scan on every video we LIKE (FOLLOW_ON_LIKE)
     dailyLimit: number;     // max follows per session (safety cap, FOLLOW_DAILY_LIMIT)
   };
 
@@ -157,8 +158,10 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     enabled: parseBool('FOLLOW_ENABLED', true),
     niche: FOLLOW_NICHE,
     language: FOLLOW_LANGUAGE,
-    // ~1 in 25 videos gets a follow scan; only niche+language matches are followed.
+    // Per-video scan probability; only niche+language matches are actually followed.
     chance: parseChance('FOLLOW_CHANCE', 0.04),
+    // Also follow-scan every video we LIKE, so engaged videos always get checked.
+    scanOnLike: parseBool('FOLLOW_ON_LIKE', true),
     // Conservative cap — following many accounts quickly is a strong ban signal.
     dailyLimit: parsePositiveInt('FOLLOW_DAILY_LIMIT', 30),
   },
