@@ -585,19 +585,20 @@ ${app.followButtonHint}
    */
   async scrollToNextVideo(): Promise<boolean> {
     try {
-      logger.debug(`📱 [Working] Scrolling to next video`);
-      
       // Get actual screen size for more precise scrolling
       const screenSize = await this.deviceManager.getScreenSize(this.deviceId);
       const centerX = Math.floor(screenSize.width / 2);
-      const startY = Math.floor(screenSize.height * 0.7); // Start from 70% down
-      const endY = Math.floor(screenSize.height * 0.3);   // End at 30% down
-      
-      await this.deviceManager.swipeScreen(this.deviceId, centerX, startY, centerX, endY, 300);
-      
+      const { startYFraction, endYFraction, durationMs } = this.presets.swipe;
+      const startY = Math.floor(screenSize.height * startYFraction);
+      const endY = Math.floor(screenSize.height * endYFraction);
+      const travelPct = Math.round((startYFraction - endYFraction) * 100);
+
+      logger.info(`📱 [Working] Sonraki videoya geçiliyor — swipe ${travelPct}% mesafe, ${durationMs}ms`);
+      await this.deviceManager.swipeScreen(this.deviceId, centerX, startY, centerX, endY, durationMs);
+
       const scrollDelay = this.getAdaptiveDelay(this.presets.video.scrollDelay);
       await this.wait(scrollDelay, 'Scroll delay between videos');
-      
+
       return true;
     } catch (error) {
       logger.error(`❌ [Working] Scroll action failed:`, error);
@@ -607,22 +608,29 @@ ${app.followButtonHint}
   }
 
   /**
-   * Watch current video for configured duration
+   * Watch current video for the configured duration. Returns how long it watched
+   * and which mode was used, so the caller can log a per-video summary. Logs the
+   * duration at INFO (before the wait) so it's visible in a normal run, not just
+   * with --debug.
    */
-  async watchVideo(): Promise<void> {
+  async watchVideo(): Promise<{ seconds: number; mode: 'quick-skip' | 'normal' }> {
+    const videoNo = this.stats.videosWatched + 1;
     // Roll dice for quick skip (1 in 5 videos)
     const skipRoll = Math.random();
-    
+
     if (skipRoll < this.presets.video.quickSkipChance) {
       // Quick skip - watch for just 1 second
-      logger.debug(`⚡ [Working] Quick skip - watching for ${this.presets.video.quickSkipDuration}s`);
-      await this.wait(this.presets.video.quickSkipDuration, 'Quick skip viewing');
-    } else {
-      // Normal watch duration
-      const watchDuration = this.getAdaptiveDelay(this.presets.video.watchDuration);
-      logger.debug(`👀 [Working] Normal viewing - watching for ${watchDuration.toFixed(1)}s`);
-      await this.wait(watchDuration, 'Normal video viewing');
+      const seconds = this.presets.video.quickSkipDuration;
+      logger.info(`👀 [Working] Video #${videoNo}: hızlı geçiş — ${seconds}s izleniyor`);
+      await this.wait(seconds, 'Quick skip viewing');
+      return { seconds, mode: 'quick-skip' };
     }
+
+    // Normal watch duration
+    const seconds = this.getAdaptiveDelay(this.presets.video.watchDuration);
+    logger.info(`👀 [Working] Video #${videoNo}: normal — ${seconds.toFixed(1)}s izleniyor`);
+    await this.wait(seconds, 'Normal video viewing');
+    return { seconds, mode: 'normal' };
   }
 
   /**
@@ -630,13 +638,19 @@ ${app.followButtonHint}
    */
   async processVideo(): Promise<boolean> {
     try {
-      logger.info(`🎬 [Working] Processing video #${this.stats.videosWatched + 1}`);
-      
-      // Step 1: Watch video (skip waiting on first video)
+      const videoNo = this.stats.videosWatched + 1;
+      logger.info(`🎬 [Working] Processing video #${videoNo}`);
+
+      // Step 1: Watch video (skip waiting on first video). Track how long we
+      // watched and in which mode so we can print a per-video summary at the end.
+      let watchSeconds = 0;
+      let watchMode: 'first' | 'quick-skip' | 'normal' = 'first';
       if (this.stats.videosWatched === 0) {
         logger.info(`⚡ [Working] First video - starting immediately without watching delay`);
       } else {
-        await this.watchVideo();
+        const watched = await this.watchVideo();
+        watchSeconds = watched.seconds;
+        watchMode = watched.mode;
       }
       
       // Step 2: Health check
@@ -705,15 +719,19 @@ ${app.followButtonHint}
       // Step 4: Decide actions and scroll to next video
       const decisions = await this.decideAction(doLike, doComment);
       logger.info(`🎯 [Working] Decided to do ${decisions.length} actions: ${decisions.map(d => d.action).join(', ')}`);
+      const executed: string[] = []; // human-readable list of actions actually taken, for the summary
       for (const decision of decisions) {
         logger.info(`🎯 [Working] Action decision: ${decision.action} - ${decision.reason}`);
         switch (decision.action) {
-          case 'like':
-            await this.executeLike();
+          case 'like': {
+            const ok = await this.executeLike();
+            executed.push(ok ? 'like✓' : 'like✗');
             break;
+          }
           case 'comment':
             if (decision.commentText) {
-              await this.executeComment(decision.commentText);
+              const ok = await this.executeComment(decision.commentText);
+              executed.push(ok ? `comment✓("${decision.commentText}")` : 'comment✗');
             } else {
               logger.warn(`⚠️ [Working] Comment text is empty, skipping`);
             }
@@ -726,6 +744,12 @@ ${app.followButtonHint}
             break;
         }
       }
+
+      // Per-video summary: how long we watched and what we actually did. INFO so
+      // it shows in a normal run (a quick, at-a-glance line per video).
+      const actionSummary = executed.length > 0 ? executed.join(', ') : 'yok (sadece izleme)';
+      const watchLabel = watchMode === 'first' ? 'ilk video (bekleme yok)' : `${watchSeconds.toFixed(1)}s (${watchMode})`;
+      logger.info(`🧾 [Working] Video #${videoNo} özeti — izleme: ${watchLabel}, aksiyon: ${actionSummary}`);
 
       // Step 4: Scroll to next video
       await this.scrollToNextVideo();

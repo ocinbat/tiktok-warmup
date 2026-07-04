@@ -13,7 +13,18 @@ export interface AutomationPresets {
     quickSkipDuration: number;       // seconds to watch before quick skip
     scrollDelay: [number, number];   // [min, max] seconds
   };
-  
+
+  // How the "next video" swipe gesture is performed. A longer travel distance
+  // makes the feed reliably advance one full video on tall/slow phones — the
+  // symptom of too short a swipe is the video springing back instead of moving
+  // on. Tune per-device with SWIPE_START_FRACTION / SWIPE_END_FRACTION /
+  // SWIPE_DURATION_MS without editing code.
+  swipe: {
+    startYFraction: number; // gesture start Y, as fraction of screen height (lower on screen)
+    endYFraction: number;   // gesture end Y, as fraction of screen height (higher on screen)
+    durationMs: number;     // gesture duration in ms
+  };
+
   interactions: {
     likeChance: number;     // 0-1 probability
     commentChance: number;  // 0-1 probability
@@ -77,6 +88,17 @@ const parseBool = (envName: string, fallback: boolean): boolean => {
   return fallback;
 };
 
+/**
+ * Read a 0..1 fraction env var (like parseChance, but semantically a screen
+ * fraction rather than a probability), falling back to a default.
+ */
+const parseFraction = (envName: string, fallback: number): number => {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+};
+
 /** Read a non-negative integer env var, falling back to a default. */
 const parsePositiveInt = (envName: string, fallback: number): number => {
   const raw = process.env[envName]?.trim();
@@ -132,7 +154,17 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     quickSkipDuration: 1,     // Watch only 1 second before skipping
     scrollDelay: [1, 3],      // Wait 1-3 seconds between videos
   },
-  
+
+  // Longer default swipe (travels 70% of the screen height, was 40%) so the feed
+  // reliably advances one video. Raise SWIPE_START_FRACTION toward 0.9 and/or
+  // lower SWIPE_END_FRACTION toward 0.1 if a phone still doesn't move on; bump
+  // SWIPE_DURATION_MS a bit if the flick is so fast it skips two videos at once.
+  swipe: {
+    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.85),
+    endYFraction: parseFraction('SWIPE_END_FRACTION', 0.15),
+    durationMs: parsePositiveInt('SWIPE_DURATION_MS', 250),
+  },
+
   interactions: {
     // Defaults stay conservative (human-like, lower shadowban risk). Override with
     // LIKE_CHANCE / COMMENT_CHANCE env vars — e.g. set both to 1 to exercise the
