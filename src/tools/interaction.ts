@@ -88,6 +88,25 @@ const VISION_MAX_OUTPUT_TOKENS = parseTokenCap(
 );
 
 /**
+ * Client-side timeout for ONE vision sub-call (generateStructured), including
+ * its internal retries. Without it a hung provider request stalls the whole
+ * video loop — observed live: MiniMax held a screenshot analysis open for
+ * 5+ minutes before returning an empty response. 120s is generous for a
+ * healthy call (normally 3-20s); a slow-but-working provider still finishes,
+ * a hung one gets cut and the caller's fallback/retry path takes over.
+ */
+const VISION_CALL_TIMEOUT_MS = (Number(process.env.VISION_TIMEOUT_S) || 120) * 1000;
+
+/**
+ * Total cap for one interactWithScreen agent run (all steps). Normal runs
+ * finish in 1-3 minutes; the learning stage's longest observed run is ~2.5
+ * minutes. When the provider hangs mid-run this aborts the whole loop so the
+ * stage-level error handling (retries, follow-scan catch, health-check catch)
+ * can continue instead of freezing forever.
+ */
+const AGENT_RUN_TIMEOUT_MS = (Number(process.env.AGENT_TIMEOUT_S) || 600) * 1000;
+
+/**
  * Order of the 4 numbers a vision model returns for a bounding box.
  * - Gemini returns [y1, x1, y2, x2] (y-first) — the default.
  * - Qwen-VL and most OpenAI-style vision models return [x1, y1, x2, y2] (x-first).
@@ -202,6 +221,7 @@ export async function generateStructured<T>(params: {
       schemaName,
       schemaDescription,
       maxOutputTokens: VISION_MAX_OUTPUT_TOKENS,
+      abortSignal: AbortSignal.timeout(VISION_CALL_TIMEOUT_MS),
     });
     return result.object as T;
   } catch (error) {
@@ -239,6 +259,7 @@ export async function generateStructured<T>(params: {
       model: visionLlm,
       messages: fallbackMessages,
       maxOutputTokens: VISION_MAX_OUTPUT_TOKENS,
+      abortSignal: AbortSignal.timeout(VISION_CALL_TIMEOUT_MS),
     });
     if (finishReason === 'length') {
       logger.warn(`⚠️ JSON fallback also hit the ${VISION_MAX_OUTPUT_TOKENS ?? 'provider default'} output-token cap — raise VISION_MAX_OUTPUT_TOKENS if the parse below fails`);
@@ -682,12 +703,18 @@ export async function interactWithScreen<T>(
       return { ...toolCall, toolName, args: JSON.stringify(cleaned) };
     };
 
-    const agentRun = await generateText({
+    let agentRun;
+    try {
+      agentRun = await generateText({
         model: llm,
         prompt,
         providerOptions: getThinkingProviderOptions(),
         maxOutputTokens: AGENT_MAX_OUTPUT_TOKENS,
         experimental_repairToolCall: repairToolCall,
+        // Hard wall-clock cap for the WHOLE run: a provider that stops
+        // responding mid-run otherwise freezes the bot forever (observed live
+        // on MiniMax). Callers catch and continue / retry.
+        abortSignal: AbortSignal.timeout(AGENT_RUN_TIMEOUT_MS),
         stopWhen: [hasToolCall('finish_task'), stepCountIs(AGENT_MAX_STEPS)],
 
         tools: {
@@ -949,6 +976,18 @@ export async function interactWithScreen<T>(
           }
         },
       });
+    } catch (error) {
+      // AbortSignal.timeout fires as a DOMException named 'TimeoutError'.
+      // Rethrow with an actionable message; the callers' catch blocks
+      // (learning retry, follow-scan guard, health-check guard) take it from here.
+      if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+        throw new Error(
+          `[Interacting#${interactionTaskId}] Agent run timed out after ${AGENT_RUN_TIMEOUT_MS / 1000}s — ` +
+            `the model provider stopped responding (check provider status / quota, or raise AGENT_TIMEOUT_S).`,
+        );
+      }
+      throw error;
+    }
 
     // generateText resolves when stopWhen is met. If the agent ran out of steps
     // without calling finish_task, the result was never captured — fail loudly
