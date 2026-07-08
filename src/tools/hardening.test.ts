@@ -175,6 +175,13 @@ describe('interpretFollowState', () => {
     expect(interpretFollowState('Follow')).toBe(false);
   });
 
+  it('treats "Takip Edin" (TikTok badge desc, creator-name prefixed) as NOT following', () => {
+    // TikTok's follow badge accessibility label — plural imperative, NOT covered
+    // by the "takip et" substring (et ≠ ed…), so it needs its own branch.
+    expect(interpretFollowState('Takip Edin')).toBe(false);
+    expect(interpretFollowState('PoolDaily Takip Edin')).toBe(false);
+  });
+
   it('treats the bare "Takip" / "Following" / "Takip Ediliyor" as already following', () => {
     // The trap: "Takip" is a substring of "Takip Et" — bare "Takip" must read as following.
     expect(interpretFollowState('Takip')).toBe(true);

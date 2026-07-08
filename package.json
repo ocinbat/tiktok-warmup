@@ -26,6 +26,7 @@
     "test-scan": "tsx src/index.ts --help",
     "test-follow": "tsx src/scripts/test-follow.ts",
     "test-provider": "tsx src/scripts/test-provider.ts",
+    "test-selectors": "tsx src/scripts/test-xml-selectors.ts",
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -9,7 +9,26 @@
  * with the `--app` CLI flag.
  */
 
+import type { UiSelector } from '../tools/uiTree.js';
+
 export type AppId = 'tiktok' | 'instagram';
+
+/**
+ * The UI roles the engine may resolve DETERMINISTICALLY from the uiautomator
+ * view hierarchy instead of asking a vision model. The first five mirror the
+ * learnable ElementLedger keys; the rest cover navigation and the follow flow.
+ */
+export type UiElementRole =
+  | 'likeButton'
+  | 'commentButton'
+  | 'commentInputField'
+  | 'commentSendButton'
+  | 'commentCloseButton'
+  | 'followButton'
+  /** Bottom-bar tab that opens the vertical video feed (IG: Reels tab; TikTok: Home). */
+  | 'feedTab'
+  /** Element whose PRESENCE proves we're on the video feed right now. */
+  | 'feedMarker';
 
 export interface AppProfile {
   /** Stable identifier, also used as the persistence key suffix and `--app` value. */
@@ -52,6 +71,26 @@ export interface AppProfile {
    * leaves this off for speed.
    */
   guardBeforeActions: boolean;
+  /**
+   * Deterministic uiautomator selectors for this app's controls, captured from
+   * real device dumps. When a role resolves here, the engine taps the element's
+   * exact bounds-center from the view hierarchy — no vision call, no coordinate
+   * guessing. A missing role (or a dump that comes back empty / unmatched) falls
+   * back to the existing learned-coordinate / vision path, so these can only
+   * improve accuracy, never break the flow.
+   *
+   * Instagram exposes STABLE resource-ids; TikTok obfuscates ids per build but
+   * keeps localized accessibility labels (content-desc), so TikTok matches by
+   * desc regex (Turkish + English variants).
+   */
+  xmlSelectors: Partial<Record<UiElementRole, UiSelector>>;
+  /**
+   * Case-insensitive regex matched against the like control's content-desc to
+   * decide "this video is ALREADY liked" straight from the view hierarchy
+   * (e.g. "Beğenmekten Vazgeç" / "Unlike"). Empty disables the XML liked-state
+   * read (vision fallback is used instead).
+   */
+  likedStateDescRegex: string;
 }
 
 export const APP_PROFILES: Record<AppId, AppProfile> = {
@@ -76,6 +115,31 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
     // pre-action check needed (keeps the proven-fast TikTok path unchanged).
     feedCheckInterval: 0,
     guardBeforeActions: false,
+    // TikTok obfuscates resource-ids per build (id/fsb, id/eda…), but its
+    // accessibility labels are rich and stable — match by content-desc regex
+    // (Turkish + English UI variants). Captured from a live Samsung dump.
+    xmlSelectors: {
+      // The clickable like CONTAINER: desc "Video beğenin. 21,7 B beğeni" /
+      // liked state "…beğenmekten vazgeçin…"; EN "Like video…" / "Unlike…".
+      likeButton: { contentDesc: '(^Video beğen)|(beğenmekten vazgeç)|(^Like video)|(^Unlike)', clickable: true },
+      // "Yorum okuyun veya ekleyin. 77 yorum" / "Read or add comments…".
+      commentButton: { contentDesc: '(^Yorum (okuyun|ekleyin))|(^Read or add comment)', clickable: true },
+      // The collapsed composer at the panel bottom, hint "Yorum ekleyin..." /
+      // "Add comment...". (Once focused the hint is replaced by typed text, but
+      // the working stage only needs the FIRST tap to focus it.)
+      commentInputField: { className: 'EditText', text: '(Yorum ekle|Add comment)' },
+      // commentSendButton: NOT resolvable — TikTok's send control only exposes an
+      // unresolved resource reference (desc "@2131823209", obfuscated id) that
+      // changes per build. The learned coordinate + vision fallback handle it,
+      // and verify_comment_posted already confirms the outcome objectively.
+      // "PoolDaily Takip Edin" (creator-name prefix) / EN "Follow …".
+      followButton: { contentDesc: '(Takip Edin)|(^Follow\\b)', clickable: true },
+      // Bottom nav "Ana sayfa" / "Home" opens the For You feed.
+      feedTab: { contentDesc: '^(Ana sayfa|Home)$', clickable: true },
+      // The For You tab label at the top exists only on the FYP feed.
+      feedMarker: { contentDesc: '^(Sizin İçin|For You)$' },
+    },
+    likedStateDescRegex: 'vazgeç|unlike',
   },
   instagram: {
     id: 'instagram',
@@ -106,6 +170,23 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
     // before every like/comment AND check periodically to recover fast.
     feedCheckInterval: 12,
     guardBeforeActions: true,
+    // Instagram ships STABLE, meaningful resource-ids — the strongest possible
+    // selectors. Captured from a live Samsung dump (Reels player + comment panel).
+    xmlSelectors: {
+      likeButton: { resourceId: 'com.instagram.android:id/like_button' },
+      commentButton: { resourceId: 'com.instagram.android:id/comment_button' },
+      commentInputField: { resourceId: 'com.instagram.android:id/layout_comment_thread_edittext_multiline' },
+      // Appears (with desc "Paylaş"/"Post") once text is in the composer.
+      commentSendButton: { resourceId: 'com.instagram.android:id/layout_comment_thread_post_button_icon' },
+      // The inline pill next to the creator name; its TEXT carries the state
+      // ("Takip Et" = not following) for interpretFollowState.
+      followButton: { resourceId: 'com.instagram.android:id/inline_follow_button' },
+      // Bottom nav bar Reels tab — THE deterministic fix for "can't reach Reels".
+      feedTab: { resourceId: 'com.instagram.android:id/clips_tab' },
+      // Present only while the full-screen Reels player is showing.
+      feedMarker: { resourceId: 'com.instagram.android:id/clips_video_container' },
+    },
+    likedStateDescRegex: 'vazgeç|unlike',
   },
 };
 

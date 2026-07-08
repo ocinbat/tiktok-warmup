@@ -32,7 +32,7 @@ export interface CommentVerifyResult {
 }
 
 /** Decode the handful of XML entities uiautomator emits in attribute values. */
-const unescapeXml = (s: string): string =>
+export const unescapeXml = (s: string): string =>
   s
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")

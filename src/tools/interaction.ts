@@ -6,9 +6,11 @@ import { z } from "zod";
 
 import { ELEMENT_KEYS, type ElementKey, type ElementLedger } from "./ElementLedger.js";
 import { ACTIVE_PROVIDER, getThinkingProviderOptions, llm, VISION_PROVIDER, visionLlm } from "./llm.js";
+import { findUiElement, screenSizeFromUiTree, type UiSelector } from "./uiTree.js";
 import { verifyCommentPosted } from "./uiVerify.js";
 import { logger, uuidv4 } from "./utils.js";
 
+import type { UiElementRole } from "@/config/apps.js";
 import type { DeviceManager } from "@/core/DeviceManager.js";
 
 /**
@@ -19,12 +21,17 @@ import type { DeviceManager } from "@/core/DeviceManager.js";
  * - `verifyComment`: enables the objective `verify_comment_posted` tool, which
  *   checks the view hierarchy (vision fallback) and locks the verified send
  *   coordinate in the ledger.
+ * - `xmlSelectors`: the app's deterministic uiautomator selectors. When a
+ *   tap_element / find_object / test_like_button call maps to one of these
+ *   roles, the element is resolved from the LIVE view hierarchy (pixel-perfect,
+ *   free) and the vision model is skipped; misses fall through to vision.
  */
 export interface InteractionOptions {
   ledger?: ElementLedger;
   verifyComment?: { expectedText: string };
   /** Enables the test_like_button tool (taps like, proves it toggled, un-likes). */
   testLike?: boolean;
+  xmlSelectors?: Partial<Record<UiElementRole, UiSelector>>;
 }
 
 /** A screenshot plus the pixel dimensions it was captured at (= tap space). */
@@ -521,9 +528,59 @@ export async function interactWithScreen<T>(
   options: InteractionOptions = {}
 ): Promise<T> {
     const interactionTaskId = uuidv4();
-    const { ledger, verifyComment, testLike } = options;
+    const { ledger, verifyComment, testLike, xmlSelectors } = options;
     let capturedResult: T | undefined;
     let finished = false;
+
+    /**
+     * Map a tool call to a deterministic selector role. A recognized elementKey
+     * IS a role; calls without one (the agent tapping "the follow button" or a
+     * nav tab by free-text query) are mapped by narrow keyword checks only —
+     * anything else stays on the vision path.
+     */
+    const resolveXmlRole = (elementKey: ElementKey | undefined, query: string): UiElementRole | undefined => {
+      if (elementKey) return elementKey;
+      if (/follow|takip/iu.test(query)) return 'followButton';
+      if (/(reels|feed|video).{0,16}tab|tab.{0,16}(reels|feed)/iu.test(query)) return 'feedTab';
+      return undefined;
+    };
+
+    /**
+     * Resolve a role's element from the LIVE view hierarchy. Returns the exact
+     * shape findObject returns on success, so the tap/ledger/return plumbing is
+     * shared verbatim with the vision path. Null = no selector for this role /
+     * dump unusable / no match → caller falls through to vision. This path is
+     * pixel-perfect where vision is a (biased) guess — see src/tools/uiTree.ts.
+     */
+    const findViaXml = async (role: UiElementRole) => {
+      const selector = xmlSelectors?.[role];
+      if (!selector) return null;
+      try {
+        const xml = await deviceManager.dumpViewHierarchy(deviceId);
+        if (!xml) return null;
+        const element = findUiElement(xml, selector);
+        if (!element?.center || !element.bounds) return null;
+        const screen = screenSizeFromUiTree(xml);
+        const label = element.contentDesc || element.text || element.resourceId || role;
+        logger.info(`🌳 [Interacting#${interactionTaskId}] Resolved "${role}" via uiautomator XML: "${label}" at (${element.center.x}, ${element.center.y})`);
+        return {
+          found: true as const,
+          outOfBounds: false as const,
+          coordinates: { x: element.center.x, y: element.center.y },
+          boundingBox: { y1: element.bounds.y1, x1: element.bounds.x1, y2: element.bounds.y2, x2: element.bounds.x2 },
+          label: `${label} (via uiautomator)`,
+          // Above vision's 0.9 (bounds are the app's own declaration, not a
+          // guess), below the 0.99 given to interaction-verified coordinates.
+          confidence: 0.98,
+          imgWidth: screen?.width ?? 0,
+          imgHeight: screen?.height ?? 0,
+          message: `Found ${role} via the view hierarchy at (${element.center.x}, ${element.center.y})`,
+        };
+      } catch (error) {
+        logger.debug(`[Interacting#${interactionTaskId}] XML lookup for "${role}" failed (falling back to vision): ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      }
+    };
 
     /**
      * Record a real detection/tap into the ledger (when one is active), keyed by
@@ -653,10 +710,18 @@ export async function interactWithScreen<T>(
                   return { error: true, found: false, message: 'No query provided. Call again with a clear query describing what to find/answer.' };
                 }
                 if (action === 'find_object') {
+                  const key = normalizeElementKey(elementKey);
+                  // Deterministic path first (see tap_element) — a READ, no tap.
+                  const role = resolveXmlRole(key, query);
+                  const xmlResult = role ? await findViaXml(role) : null;
+                  if (xmlResult) {
+                    recordToLedger(key, xmlResult, false);
+                    return xmlResult;
+                  }
                   const shot = await deviceManager.takeScreenshotWithDims(deviceId);
                   const findResult = await findObject(interactionTaskId, shot, query);
                   // find_object is a READ (no tap), so record tapped:false.
-                  if (findResult.found) recordToLedger(normalizeElementKey(elementKey), findResult, false);
+                  if (findResult.found) recordToLedger(key, findResult, false);
                   return findResult;
                 } else {
                   // Default path: any non-'find_object' action answers a question.
@@ -685,6 +750,18 @@ export async function interactWithScreen<T>(
                 if (!query.trim()) {
                   return { tapped: false, found: false, message: 'No element description provided. Call tap_element again with a clear query.' };
                 }
+                const key = normalizeElementKey(elementKey);
+                // Deterministic path first: resolve the element from the live view
+                // hierarchy when the app declares a selector for this role. Falls
+                // through to the vision detection below on any miss.
+                const role = resolveXmlRole(key, query);
+                const xmlResult = role ? await findViaXml(role) : null;
+                if (xmlResult) {
+                  await deviceManager.tapScreen(deviceId, xmlResult.coordinates.x, xmlResult.coordinates.y);
+                  logger.info(`👆 [Interacting#${interactionTaskId}] Tapped "${query}" via XML at (${xmlResult.coordinates.x}, ${xmlResult.coordinates.y})`);
+                  recordToLedger(key, xmlResult, true);
+                  return { tapped: true, found: true, coordinates: xmlResult.coordinates, boundingBox: xmlResult.boundingBox, message: `Found and tapped ${query} at (${xmlResult.coordinates.x}, ${xmlResult.coordinates.y}) via the view hierarchy` };
+                }
                 const shot = await deviceManager.takeScreenshotWithDims(deviceId);
                 const findResult = await findObject(interactionTaskId, shot, query);
                 const { coordinates } = findResult;
@@ -696,7 +773,7 @@ export async function interactWithScreen<T>(
                 await deviceManager.tapScreen(deviceId, coordinates.x, coordinates.y);
                 logger.info(`👆 [Interacting#${interactionTaskId}] Found and tapped "${query}" at (${coordinates.x}, ${coordinates.y})`);
                 // Record the coordinate we ACTUALLY tapped (tapped:true).
-                recordToLedger(normalizeElementKey(elementKey), findResult, true);
+                recordToLedger(key, findResult, true);
                 return { tapped: true, found: true, coordinates, boundingBox: findResult.boundingBox, message: `Found and tapped ${query} at (${coordinates.x}, ${coordinates.y})` };
               } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
@@ -748,8 +825,13 @@ export async function interactWithScreen<T>(
                 };
                 const wait = (s: number) => new Promise((r) => setTimeout(r, s * 1000));
                 try {
-                  const shot = await deviceManager.takeScreenshotWithDims(deviceId);
-                  const findResult = await findObject(interactionTaskId, shot, query);
+                  // Deterministic path first: the like control straight from the
+                  // view hierarchy; vision detection only when XML can't resolve it.
+                  const xmlResult = await findViaXml('likeButton');
+                  const findResult = xmlResult ?? await (async () => {
+                    const shot = await deviceManager.takeScreenshotWithDims(deviceId);
+                    return findObject(interactionTaskId, shot, query);
+                  })();
                   const { coordinates } = findResult;
                   if (!findResult.found || !coordinates) {
                     return { verified: false, found: false, message: findResult.message ?? `Could not find the like button: ${query}`, suggestion: 'Take a screenshot and try again with a more specific description.' };

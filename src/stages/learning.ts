@@ -145,7 +145,15 @@ export class LearningStage {
           this.deviceManager,
           {},
           LearningResultSchema,
-          { ledger, verifyComment: { expectedText: TEST_COMMENT }, testLike: true },
+          {
+            ledger,
+            verifyComment: { expectedText: TEST_COMMENT },
+            testLike: true,
+            // Deterministic uiautomator selectors: tap_element / test_like_button
+            // resolve these roles from the live view hierarchy (pixel-perfect)
+            // and only fall back to vision when the XML can't answer.
+            xmlSelectors: this.app.xmlSelectors,
+          },
         );
         return this.buildResultFromLedger(ledger, modelResult);
       } catch (error) {

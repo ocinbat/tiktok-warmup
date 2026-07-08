@@ -34,7 +34,9 @@ export class UIDataPersistence {
   // the device re-learns with the improved flow — no manual JSON deletion needed.
   //   1.0.0  legacy (LLM-transcribed coords, vision-only "did it post?")
   //   2.0.0  ledger-captured coords, objective verify, like test, send plausibility
-  private static readonly CURRENT_VERSION = '2.0.0';
+  //   3.0.0  XML-first capture (uiautomator selectors resolve elements before
+  //          vision) — invalidates older vision-guessed coordinates
+  private static readonly CURRENT_VERSION = '3.0.0';
 
   /**
    * Get full path to data file

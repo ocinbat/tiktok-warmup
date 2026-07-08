@@ -155,12 +155,14 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     scrollDelay: [1, 3],      // Wait 1-3 seconds between videos
   },
 
-  // Longer default swipe (travels 70% of the screen height, was 40%) so the feed
-  // reliably advances one video. Raise SWIPE_START_FRACTION toward 0.9 and/or
-  // lower SWIPE_END_FRACTION toward 0.1 if a phone still doesn't move on; bump
-  // SWIPE_DURATION_MS a bit if the flick is so fast it skips two videos at once.
+  // Longer default swipe (travels 60% of the screen height, was 40%) so the feed
+  // reliably advances one video. The start sits at 75% — BELOW the action rail
+  // but ABOVE the bottom strip where sponsored reels put their CTA banner
+  // (~89-95% of screen height); starting on that banner can eat the gesture or
+  // click the ad. Lower SWIPE_END_FRACTION toward 0.1 if a phone still doesn't
+  // move on; bump SWIPE_DURATION_MS if one flick skips two videos at once.
   swipe: {
-    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.85),
+    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.75),
     endYFraction: parseFraction('SWIPE_END_FRACTION', 0.15),
     durationMs: parsePositiveInt('SWIPE_DURATION_MS', 250),
   },

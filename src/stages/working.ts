@@ -3,9 +3,11 @@ import { z } from 'zod';
 import type { AutomationPresets } from '../config/presets.js';
 import type { LearnedUIElements } from '../core/Worker.js';
 import { interactWithScreen } from '../tools/interaction.js';
+import { findUiElement, type UiTreeNode } from '../tools/uiTree.js';
 import { verifyCommentPosted } from '../tools/uiVerify.js';
 import { logger } from '../tools/utils.js';
 
+import type { UiElementRole } from '@/config/apps.js';
 import type { DeviceManager } from '@/core/DeviceManager.js';
 
 /**
@@ -47,8 +49,12 @@ export function interpretFollowState(buttonText: string | undefined): boolean | 
   if (!t) return undefined;
   // "Already following" forms first, so "Following" isn't caught by the "follow" check.
   if (t.includes('following') || t.includes('ediliyor')) return true;
-  // "Not following" forms — check "takip et" BEFORE the bare "takip" below.
-  if (t.includes('takip et') || /\bfollow\b/.test(t)) return false;
+  // "Not following" forms — check "takip et"/"takip edin" BEFORE the bare "takip"
+  // below. "Takip Edin" is TikTok's follow-control label (accessibility desc like
+  // "PoolDaily Takip Edin"), the plural-imperative of "Takip Et" — both mean NOT
+  // following, and "takip et" as a substring does NOT cover "takip edin"
+  // (et ≠ ed…), so it needs its own check.
+  if (t.includes('takip et') || t.includes('takip edin') || /\bfollow\b/.test(t)) return false;
   // The bare word "takip" (no "et") is Instagram's compact "already following" label.
   if (t.includes('takip')) return true;
   return undefined;
@@ -189,6 +195,44 @@ export class WorkingStage {
   }
 
   /**
+   * Resolve one of the app's declared UI roles from the LIVE view hierarchy.
+   * Pixel-perfect and free where vision is a paid, biased guess. Null on any
+   * miss (no selector, dump unusable, element not on screen) — callers fall
+   * back to the learned coordinate / vision path, so this only ever helps.
+   */
+  private async findXmlElement(role: UiElementRole): Promise<UiTreeNode | null> {
+    const selector = this.presets.app.xmlSelectors[role];
+    if (!selector) return null;
+    try {
+      const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+      if (!xml) return null;
+      return findUiElement(xml, selector);
+    } catch (error) {
+      logger.debug(`[Working] XML lookup for "${role}" failed (non-fatal):`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Resolve where to tap for a role: the live view hierarchy first (exact,
+   * current), then the coordinate learned during the learning stage. Null when
+   * neither source has it.
+   */
+  private async resolveTapTarget(
+    role: UiElementRole,
+    learned: { x: number; y: number } | undefined,
+  ): Promise<{ x: number; y: number; source: 'uiautomator' | 'learned' } | null> {
+    const element = await this.findXmlElement(role);
+    if (element?.center) {
+      return { x: element.center.x, y: element.center.y, source: 'uiautomator' };
+    }
+    if (learned) {
+      return { x: learned.x, y: learned.y, source: 'learned' };
+    }
+    return null;
+  }
+
+  /**
    * Build the action(s) for this video. The like/comment dice are rolled by the
    * caller (processVideo) so it can run the feed guard BEFORE we generate a
    * comment — otherwise a recovery mid-cycle could post a comment written for the
@@ -297,32 +341,47 @@ export class WorkingStage {
    */
   async executeLike(): Promise<boolean> {
     try {
-      if (!this.learnedUI.likeButton) {
-        logger.error(`❌ [Working] Like button coordinates not learned`);
+      // The live view hierarchy first (the heart's exact bounds on THIS video),
+      // then the coordinate the learning stage PROVED toggles the like.
+      const target = await this.resolveTapTarget('likeButton', this.learnedUI.likeButton);
+      if (!target) {
+        logger.error(`❌ [Working] Like button not found (no XML match, no learned coordinate)`);
         return false;
       }
 
-      // Tap the learned heart coordinate. The learning stage's test_like_button
-      // PROVED this exact coordinate toggles the like (tap → liked → untap), so a
-      // single tap here reliably likes the video.
-      const { x, y } = this.learnedUI.likeButton;
-      logger.info(`❤️ [Working] Liking video at (${x}, ${y})`);
-      await this.deviceManager.tapScreen(this.deviceId, x, y);
+      logger.info(`❤️ [Working] Liking video at (${target.x}, ${target.y}) [${target.source}]`);
+      await this.deviceManager.tapScreen(this.deviceId, target.x, target.y);
       await this.wait(1, 'After like tap');
       this.stats.likesGiven++;
 
       // Verify for visibility/logging ONLY. We do NOT re-tap on a negative
       // reading: the like is a TOGGLE, so a retap driven by a flaky reading would
-      // UNDO a like that actually registered. Correctness comes from the learned
-      // coordinate having been verified during learning.
+      // UNDO a like that actually registered. Ground truth first: the like
+      // control's accessibility label flips to "…vazgeç"/"Unlike" when liked —
+      // read it from the view hierarchy for free; vision only when XML can't say.
       try {
-        const liked = (await this.takeAndAnalyzeScreenshot(
-          `Look at the like button (the heart icon on the right side of the video). Is it now in the LIKED state — filled/solid and red/colored — rather than an empty outline? Answer YES or NO.`
-        )).toUpperCase().includes('YES');
-        if (liked) {
-          logger.info(`❤️ [Working] Like confirmed registered`);
+        const { likedStateDescRegex } = this.presets.app;
+        const likeNode = likedStateDescRegex ? await this.findXmlElement('likeButton') : null;
+        let liked: boolean;
+        let via: string;
+        if (likeNode && likedStateDescRegex) {
+          // Liked state shows either in the label ("…vazgeç"/"Unlike" — TikTok)
+          // or in Android's selected flag (Instagram keeps the label "Beğen" and
+          // flips selected="true").
+          liked = likeNode.selected || new RegExp(likedStateDescRegex, 'iu').test(likeNode.contentDesc || likeNode.text);
+          via = 'uiautomator';
+          // Raw evidence for debugging like-verification false negatives.
+          logger.info(`🔬 [Working] Like node after tap: selected=${likeNode.selected} desc="${likeNode.contentDesc}" text="${likeNode.text}" → liked=${liked}`);
         } else {
-          logger.warn(`⚠️ [Working] Like tap done but could not confirm it registered — if this persists, delete data/learned-ui-data.json and re-learn.`);
+          liked = (await this.takeAndAnalyzeScreenshot(
+            `Look at the like button (the heart icon on the right side of the video). Is it now in the LIKED state — filled/solid and red/colored — rather than an empty outline? Answer YES or NO.`
+          )).toUpperCase().includes('YES');
+          via = 'vision';
+        }
+        if (liked) {
+          logger.info(`❤️ [Working] Like confirmed registered (via ${via})`);
+        } else {
+          logger.warn(`⚠️ [Working] Like tap done but could not confirm it registered (via ${via}) — if this persists, delete data/learned-ui-data.json and re-learn.`);
         }
       } catch (error) {
         logger.debug(`[Working] Like verification skipped (non-fatal):`, error);
@@ -342,8 +401,16 @@ export class WorkingStage {
   async executeComment(commentText: string): Promise<boolean> {
     try {
       // commentCloseButton is no longer required — we close with the back button.
-      if (!this.learnedUI.commentButton || !this.learnedUI.commentInputField || !this.learnedUI.commentSendButton) {
-        logger.error(`❌ [Working] Comment UI coordinates not fully learned`);
+      // Each role needs SOME coordinate source: a live XML selector or the
+      // coordinate learned during the learning stage (resolved per-tap below).
+      const canResolve = (role: UiElementRole, learned?: { x: number; y: number }): boolean =>
+        Boolean(learned || this.presets.app.xmlSelectors[role]);
+      if (
+        !canResolve('commentButton', this.learnedUI.commentButton) ||
+        !canResolve('commentInputField', this.learnedUI.commentInputField) ||
+        !canResolve('commentSendButton', this.learnedUI.commentSendButton)
+      ) {
+        logger.error(`❌ [Working] Comment UI coordinates not fully learned (and no XML selectors to fall back on)`);
         return false;
       }
 
@@ -357,28 +424,47 @@ export class WorkingStage {
 
       logger.info(`💬 [Working] Commenting: "${commentText}" (settle ${settleWait}s / nav ${navWait}s)`);
 
-      // Step 1: Click comment button
-      const { x: commentX, y: commentY } = this.learnedUI.commentButton;
-      await this.deviceManager.tapScreen(this.deviceId, commentX, commentY);
+      // Step 1: Click comment button (live XML bounds first, learned coordinate second)
+      const commentBtn = await this.resolveTapTarget('commentButton', this.learnedUI.commentButton);
+      if (!commentBtn) {
+        logger.error(`❌ [Working] Comment button not found on this screen`);
+        return false;
+      }
+      logger.info(`💬 [Working] Tapping comment button at (${commentBtn.x}, ${commentBtn.y}) [${commentBtn.source}]`);
+      await this.deviceManager.tapScreen(this.deviceId, commentBtn.x, commentBtn.y);
       await this.wait(settleWait, 'After comment button tap (panel opening)');
 
       // Step 1b: Make sure the comment panel actually opened. Some videos have
       // comments turned off (the comment button is disabled and does nothing),
       // which would otherwise send the agent looking for an input/send button
-      // that isn't there and loop until the step limit.
-      const panelState = (await this.takeAndAnalyzeScreenshot(
-        `Did the comment section open? If a comment panel/sheet with a text input box to write a comment is now visible, answer exactly OPEN. If comments are turned off/disabled for this video (e.g. a message like "Comments are turned off", or no comment input is available), answer exactly DISABLED.`
-      )).toUpperCase();
-      if (!panelState.includes('OPEN')) {
+      // that isn't there and loop until the step limit. Ground truth first: the
+      // composer input showing up in the view hierarchy IS the panel being open;
+      // ask vision only when XML can't see it.
+      let panelOpen = Boolean(await this.findXmlElement('commentInputField'));
+      if (!panelOpen) {
+        const panelState = (await this.takeAndAnalyzeScreenshot(
+          `Did the comment section open? If a comment panel/sheet with a text input box to write a comment is now visible, answer exactly OPEN. If comments are turned off/disabled for this video (e.g. a message like "Comments are turned off", or no comment input is available), answer exactly DISABLED.`
+        )).toUpperCase();
+        panelOpen = panelState.includes('OPEN');
+      }
+      if (!panelOpen) {
         logger.warn(`⚠️ [Working] Comment panel did not open (comments likely disabled); skipping comment for this video`);
         await this.deviceManager.pressKey(this.deviceId, 'back');
         await this.wait(navWait, 'After dismissing closed comment panel');
         return false;
       }
 
-      // Step 2: Click input field
-      const { x: inputX, y: inputY } = this.learnedUI.commentInputField;
-      await this.deviceManager.tapScreen(this.deviceId, inputX, inputY);
+      // Step 2: Click input field (live XML bounds track the panel's actual
+      // position — the learned coordinate can drift with keyboard/panel layout)
+      const input = await this.resolveTapTarget('commentInputField', this.learnedUI.commentInputField);
+      if (!input) {
+        logger.warn(`⚠️ [Working] Comment input field not found; closing panel`);
+        await this.deviceManager.pressKey(this.deviceId, 'back');
+        await this.wait(navWait, 'After dismissing comment panel');
+        return false;
+      }
+      logger.info(`💬 [Working] Tapping comment input at (${input.x}, ${input.y}) [${input.source}]`);
+      await this.deviceManager.tapScreen(this.deviceId, input.x, input.y);
       await this.wait(settleWait, 'After input field tap (let keyboard settle)');
 
       // Step 3: Type comment text
@@ -403,10 +489,18 @@ export class WorkingStage {
         return v.toUpperCase().includes('YES');
       };
 
-      // Step 5a: Submit using the learned send-button coordinate.
-      const { x: sendX, y: sendY } = this.learnedUI.commentSendButton;
-      await this.deviceManager.tapScreen(this.deviceId, sendX, sendY);
-      let posted = await verifyPosted();
+      // Step 5a: Submit. The send control only appears once text is in the box,
+      // so resolve it NOW: live XML bounds (Instagram exposes a stable id; on
+      // TikTok it's obfuscated so this resolves to the learned coordinate).
+      const send = await this.resolveTapTarget('commentSendButton', this.learnedUI.commentSendButton);
+      let posted = false;
+      if (send) {
+        logger.info(`💬 [Working] Tapping send at (${send.x}, ${send.y}) [${send.source}]`);
+        await this.deviceManager.tapScreen(this.deviceId, send.x, send.y);
+        posted = await verifyPosted();
+      } else {
+        logger.warn(`⚠️ [Working] Send button not resolvable from XML or learned data; going straight to the visual fallback`);
+      }
 
       // Step 5b: The send button moves depending on the active keyboard, so if
       // the saved coordinate missed, locate and tap it visually instead.
@@ -477,16 +571,21 @@ export class WorkingStage {
     try {
       logger.info(`🔎 [Working] Niche-follow scan (niche="${follow.niche}", language=${follow.language})`);
       const analysis = await this.analyzeForNicheFollow();
-      // Prefer a deterministic read of the exact button text over the model's
-      // boolean — the model keeps misreading "Takip Et" (not following) as the
-      // bare "Takip" (already following). Fall back to the model only when the
-      // button text is unreadable.
-      const interpreted = interpretFollowState(analysis.followButtonText);
+      // Follow state, most reliable source first:
+      // 1. The follow control's OWN text/label read from the view hierarchy
+      //    (ground truth — Instagram's button text, TikTok's badge desc).
+      // 2. The exact button text the vision model transcribed.
+      // 3. The model's boolean (it keeps misreading "Takip Et" as "Takip").
+      const xmlFollowNode = await this.findXmlElement('followButton');
+      const xmlButtonText = xmlFollowNode ? (xmlFollowNode.text || xmlFollowNode.contentDesc) : undefined;
+      const interpreted = interpretFollowState(xmlButtonText) ?? interpretFollowState(analysis.followButtonText);
       const alreadyFollowing = interpreted ?? analysis.alreadyFollowing;
+      const stateSource = interpretFollowState(xmlButtonText) !== undefined
+        ? 'uiautomator'
+        : interpreted !== undefined ? 'button text' : 'model';
       logger.info(
         `🔎 [Working] Follow scan: niche=${analysis.matchesNiche} lang=${analysis.isTargetLanguage} ` +
-          `button="${analysis.followButtonText}" alreadyFollowing=${alreadyFollowing}` +
-          `${interpreted === undefined ? ' (model)' : ' (from button text)'} ` +
+          `button="${xmlButtonText ?? analysis.followButtonText}" alreadyFollowing=${alreadyFollowing} (${stateSource}) ` +
           `normalFeed=${analysis.screenLooksLikeNormalFeed} (${analysis.confidence}) — ${analysis.creatorNote}`,
       );
 
@@ -549,10 +648,75 @@ We follow a creator ONLY when BOTH are true:
 
   /**
    * Tap the follow control for the current creator and confirm the state changed.
-   * Uses on-demand vision (tap_element) rather than a learned coordinate, since
-   * follows are rare and the avatar/badge position is stable but app-specific.
+   * Deterministic path first: the follow control's live bounds + state from the
+   * view hierarchy (tap center, re-read to confirm). Falls back to the vision
+   * agent when the hierarchy can't resolve it.
    */
   private async executeFollow(): Promise<boolean> {
+    const xmlResult = await this.executeFollowViaXml();
+    if (xmlResult !== undefined) return xmlResult;
+    return this.executeFollowViaAgent();
+  }
+
+  /**
+   * XML-deterministic follow. Returns:
+   * - true/false → handled here (tapped and confirmed / tapped but unconfirmed)
+   * - undefined  → hierarchy can't resolve the control; use the vision agent.
+   * Confirmation after the tap: Instagram's button text flips to the followed
+   * form ("Takip"/"Following"); TikTok's red + badge node DISAPPEARS entirely.
+   */
+  private async executeFollowViaXml(): Promise<boolean | undefined> {
+    const before = await this.findXmlElement('followButton');
+    if (!before?.center) return undefined;
+
+    const beforeState = interpretFollowState(before.text || before.contentDesc);
+    if (beforeState === true) {
+      // Already following — do NOT tap (it would unfollow).
+      logger.info(`➡️ [Working] Follow control already in followed state (via uiautomator); not tapping`);
+      return true;
+    }
+
+    logger.info(`➕ [Working] Tapping follow at (${before.center.x}, ${before.center.y}) [uiautomator, "${before.text || before.contentDesc}"]`);
+    await this.deviceManager.tapScreen(this.deviceId, before.center.x, before.center.y);
+    await this.wait(2, 'After follow tap');
+
+    try {
+      const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+      if (!xml) {
+        // Dump went unusable right after a deterministic tap on a control we had
+        // POSITIVELY read as not-followed — count it as done rather than risking
+        // an agent retap that would unfollow.
+        logger.info(`➕ [Working] Follow tapped; post-tap hierarchy unavailable, assuming it registered`);
+        return true;
+      }
+
+      // MUST end on the feed (the agent flow guaranteed this too). If the feed
+      // marker vanished, the tap most likely opened the creator's PROFILE page
+      // (on TikTok the + badge hugs the avatar's bottom edge) — the follow did
+      // NOT happen; press back to the feed and report failure.
+      const markerSelector = this.presets.app.xmlSelectors.feedMarker;
+      if (markerSelector && !findUiElement(xml, markerSelector)) {
+        logger.warn(`⚠️ [Working] Left the ${this.presets.app.feedName} after the follow tap (profile page likely opened); pressing back`);
+        await this.deviceManager.pressKey(this.deviceId, 'back');
+        await this.wait(1.5, 'After back (recover from profile page)');
+        return false;
+      }
+
+      const selector = this.presets.app.xmlSelectors.followButton;
+      const after = selector ? findUiElement(xml, selector) : null;
+      if (!after) return true; // TikTok: the + badge is gone → followed
+      const afterState = interpretFollowState(after.text || after.contentDesc);
+      if (afterState === true) return true; // Instagram: text flipped → followed
+      logger.warn(`⚠️ [Working] Follow control still reads "${after.text || after.contentDesc}" after the tap`);
+      return false;
+    } catch (error) {
+      logger.debug(`[Working] Post-follow verification failed (non-fatal):`, error);
+      return true;
+    }
+  }
+
+  /** Vision-agent follow — the fallback when the view hierarchy can't resolve the control. */
+  private async executeFollowViaAgent(): Promise<boolean> {
     const { app } = this.presets;
     const prompt = `You are a ${app.displayName} automation agent. FOLLOW the creator of the CURRENT video, then confirm it.
 
@@ -848,10 +1012,76 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
   }
 
   /**
-   * Fast single-screenshot check: are we on the normal video feed right now?
-   * Much cheaper than performHealthCheck — used by the frequent feed guard.
+   * Decide "are we on the video feed?" from ONE view-hierarchy dump.
+   * true/false = certain; undefined = the hierarchy can't tell (ask vision).
+   * SPONSORED reels swap the player container id, so the feed marker alone
+   * misses ads — the like/comment action rail (whose selectors only match the
+   * video feed, not e.g. Instagram Home's row_feed_* buttons) also counts as
+   * proof. Without this, every periodic check landing on an ad stalls ~30s in
+   * the vision fallback.
+   */
+  private isFeedXml(xml: string): boolean | undefined {
+    const selectors = this.presets.app.xmlSelectors;
+    if (!xml || !selectors.feedMarker) return undefined;
+    if (findUiElement(xml, selectors.feedMarker)) {
+      logger.info(`🔬 [Working] Feed check: ON feed (marker)`);
+      return true;
+    }
+    if (selectors.likeButton && findUiElement(xml, selectors.likeButton)) {
+      logger.info(`🔬 [Working] Feed check: ON feed (action rail — sponsored/variant layout, no marker)`);
+      return true;
+    }
+    if (selectors.commentButton && findUiElement(xml, selectors.commentButton)) {
+      logger.info(`🔬 [Working] Feed check: ON feed (comment rail — sponsored/variant layout, no marker)`);
+      return true;
+    }
+    // No player, no action rail — but the app's own nav bar is visible: we're
+    // inside the app on some other screen (Home, DMs, profile) → off the feed.
+    if (selectors.feedTab && findUiElement(xml, selectors.feedTab)) {
+      logger.info(`🔬 [Working] Feed check: OFF feed (nav bar visible, no player/rail)`);
+      return false;
+    }
+    logger.info(`🔬 [Working] Feed check: UNKNOWN from XML → vision decides`);
+    return undefined;
+  }
+
+  /**
+   * isFeedXml over a fresh dump. undefined when the dump is unusable. A video
+   * feed is constant animation, so uiautomator's "could not get idle state"
+   * empty dump is a routine transient — retry once before giving up, otherwise
+   * every transient failure cascades into a ~30s vision check / agent recovery.
+   */
+  private async isOnFeedViaXml(): Promise<boolean | undefined> {
+    try {
+      let xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+      if (!xml) {
+        await this.wait(1, 'Retry view-hierarchy dump (transient idle-state failure)');
+        xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+      }
+      return this.isFeedXml(xml);
+    } catch (error) {
+      logger.debug(`[Working] isOnFeedViaXml failed (non-fatal):`, error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Fast check: are we on the normal video feed right now? Ground truth first —
+   * the view hierarchy (feed marker OR the like/comment action rail; see
+   * isFeedXml) — then vision only when the hierarchy can't decide. Much
+   * cheaper than performHealthCheck.
    */
   private async isOnFeed(): Promise<boolean> {
+    const xmlAnswer = await this.isOnFeedViaXml();
+    if (xmlAnswer === true) {
+      logger.debug(`[Working] On the ${this.presets.app.feedName} (via uiautomator)`);
+      return true;
+    }
+    if (xmlAnswer === false) {
+      logger.info(`🌳 [Working] Off the ${this.presets.app.feedName}: app nav bar visible but no feed marker/action rail (via uiautomator)`);
+      return false;
+    }
+
     const { app } = this.presets;
     const answer = (await this.takeAndAnalyzeScreenshot(
       `Are we on the normal ${app.displayName} ${app.feedName} RIGHT NOW — a FULL-SCREEN vertical video with like/comment icons stacked on the right side? Answer exactly "YES". ` +
@@ -861,11 +1091,41 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
   }
 
   /**
+   * Deterministic feed navigation: if the feed marker is already in the view
+   * hierarchy we're done; else find the app's feed TAB (IG: Reels tab by
+   * resource-id; TikTok: Home by label), tap its exact center, and confirm the
+   * marker appeared. This is THE fix for "the agent can't hit the Reels tab":
+   * no vision, no guessing, no y-bias. False → the caller runs its heavier
+   * (agent-driven) recovery.
+   */
+  private async tryNavigateToFeedViaXml(context: string): Promise<boolean> {
+    // Full feed detection (marker OR action rail — ads lack the marker), not
+    // just the marker, both before and after the tab tap.
+    if (await this.isOnFeedViaXml() === true) return true;
+    const tab = await this.findXmlElement('feedTab');
+    if (!tab?.center) return false;
+
+    logger.info(`🌳 [Working] Tapping the ${this.presets.app.feedName} tab at (${tab.center.x}, ${tab.center.y}) [uiautomator, ${context}]`);
+    await this.deviceManager.tapScreen(this.deviceId, tab.center.x, tab.center.y);
+    await this.wait(2.5, 'After feed tab tap');
+
+    if (await this.isOnFeedViaXml() === true) {
+      logger.info(`✅ [Working] Reached the ${this.presets.app.feedName} deterministically (${context})`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Get back to the video feed: close whatever wrong screen we're on (DM, profile,
    * popup, home timeline…), navigate to the feed via the app's nav hint, and fall
    * back to a cold restart if needed. Returns true only if it ends on the feed.
    */
   private async recoverToFeed(): Promise<boolean> {
+    // Deterministic first: the common drift case is "sitting on another tab of
+    // the app" — one exact tap on the feed tab fixes it without any LLM.
+    if (await this.tryNavigateToFeedViaXml('recovery')) return true;
+
     const { app } = this.presets;
     const prompt = `You are a ${app.displayName} automation agent. Get BACK to the normal ${app.feedName} (full-screen vertical video feed) as quickly as possible.
 
@@ -944,6 +1204,14 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
   async ensureAppReady(): Promise<boolean> {
     const { app } = this.presets;
     logger.info(`🔍 [Working] Ensuring ${app.displayName} is ready...`);
+
+    // Deterministic first: when the app is already up, one exact XML-guided tap
+    // reaches the feed (e.g. Instagram Home → Reels) with zero LLM calls. Any
+    // miss (app not running, login screen, popup) falls through to the agent.
+    if (await this.tryNavigateToFeedViaXml('startup')) {
+      logger.info(`✅ [Working] ${app.displayName} is ready (feed reached deterministically)`);
+      return true;
+    }
 
     const prompt = `You are a ${app.displayName} automation agent ensuring the app's ${app.feedName} is ready before starting work.
 
