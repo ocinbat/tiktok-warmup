@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { AutomationPresets } from '../config/presets.js';
 import type { LearnedUIElements } from '../core/Worker.js';
 import { interactWithScreen } from '../tools/interaction.js';
-import { findUiElement, type UiTreeNode } from '../tools/uiTree.js';
+import { findUiElement, findUiElements, type UiTreeNode } from '../tools/uiTree.js';
 import { verifyCommentPosted } from '../tools/uiVerify.js';
 import { logger } from '../tools/utils.js';
 
@@ -131,6 +131,13 @@ export class WorkingStage {
   private healthFailureExceeded = false;
   /** Logged once when the per-session follow cap is hit, to avoid spamming. */
   private followLimitLogged = false;
+  /**
+   * Fingerprint (author/caption text) of the post seen after the LAST swipe,
+   * used to verify the next swipe actually advanced the feed. TikTok photo-mode
+   * posts silently swallow some swipe gestures — without this check the bot
+   * "watches" the same carousel forever.
+   */
+  private lastPostFingerprint: string | null = null;
 
   constructor(
     deviceId: string, 
@@ -745,7 +752,28 @@ ${app.followButtonHint}
   }
 
   /**
-   * Scroll to next video
+   * Fingerprint of the CURRENT post (author + caption text via the app's
+   * postTitle selector). null = can't read right now (no selector / dump
+   * unusable) — the caller skips verification for that round.
+   */
+  private async readPostFingerprint(): Promise<string | null> {
+    const selector = this.presets.app.xmlSelectors.postTitle;
+    if (!selector) return null;
+    try {
+      const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+      if (!xml) return null;
+      const parts = findUiElements(xml, selector).map((n) => n.text || n.contentDesc).filter(Boolean);
+      return parts.length > 0 ? parts.join('|') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Scroll to next video — and VERIFY the feed actually advanced. TikTok
+   * photo-mode (carousel) posts swallow some swipe gestures; comparing the post
+   * fingerprint before/after catches that and retries once, so the bot can
+   * never sit "watching" the same carousel forever.
    */
   async scrollToNextVideo(): Promise<boolean> {
     try {
@@ -762,6 +790,23 @@ ${app.followButtonHint}
 
       const scrollDelay = this.getAdaptiveDelay(this.presets.video.scrollDelay);
       await this.wait(scrollDelay, 'Scroll delay between videos');
+
+      // Swipe verification: same fingerprint as after the previous swipe means
+      // the gesture was swallowed — swipe once more. A null read (transient
+      // dump failure) skips verification for this round.
+      const fingerprint = await this.readPostFingerprint();
+      if (fingerprint !== null && this.lastPostFingerprint !== null && fingerprint === this.lastPostFingerprint) {
+        logger.warn(`⚠️ [Working] Swipe gönderiyi İLERLETMEDİ (aynı içerik ekranda) — bir kez daha kaydırılıyor`);
+        await this.deviceManager.swipeScreen(this.deviceId, centerX, startY, centerX, endY, durationMs);
+        await this.wait(Math.max(1.5, scrollDelay * 0.5), 'After retry swipe');
+        const after = await this.readPostFingerprint();
+        if (after !== null && after === fingerprint) {
+          logger.warn(`⚠️ [Working] Retry de ilerletemedi — bir sonraki döngüde tekrar denenecek`);
+        }
+        this.lastPostFingerprint = after;
+      } else {
+        this.lastPostFingerprint = fingerprint;
+      }
 
       return true;
     } catch (error) {
@@ -1022,7 +1067,16 @@ Before finishing the task, make sure to take a screenshot of the screen and anal
    */
   private isFeedXml(xml: string): boolean | undefined {
     const selectors = this.presets.app.xmlSelectors;
-    if (!xml || !selectors.feedMarker) return undefined;
+    if (!xml) return undefined;
+    // The app isn't even on screen (crashed / backgrounded → launcher or
+    // another app): none of the dump's nodes belong to its package. Definitely
+    // off the feed — no need to ask vision. (Observed live: TikTok died and
+    // the bot kept "watching" the Samsung home screen.)
+    if (!xml.includes(`package="${this.presets.app.appPackage}"`)) {
+      logger.info(`🔬 [Working] Feed check: OFF feed — ${this.presets.app.displayName} is not on screen (launcher/other app in front)`);
+      return false;
+    }
+    if (!selectors.feedMarker) return undefined;
     if (findUiElement(xml, selectors.feedMarker)) {
       logger.info(`🔬 [Working] Feed check: ON feed (marker)`);
       return true;

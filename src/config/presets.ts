@@ -155,16 +155,17 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     scrollDelay: [1, 3],      // Wait 1-3 seconds between videos
   },
 
-  // Longer default swipe (travels 60% of the screen height, was 40%) so the feed
-  // reliably advances one video. The start sits at 75% — BELOW the action rail
-  // but ABOVE the bottom strip where sponsored reels put their CTA banner
-  // (~89-95% of screen height); starting on that banner can eat the gesture or
-  // click the ad. Lower SWIPE_END_FRACTION toward 0.1 if a phone still doesn't
-  // move on; bump SWIPE_DURATION_MS if one flick skips two videos at once.
+  // CENTRAL swipe (65% → 25% of screen height, 300ms) — measured on-device as
+  // the shape BOTH post types accept. TikTok photo-mode (carousel) posts
+  // silently swallow swipes whose endpoints reach into the top/bottom screen
+  // bands (0.75→0.15 never advanced them at any duration), while the central
+  // gesture advances photos AND videos. Also stays clear of sponsored posts'
+  // bottom CTA banner. scrollToNextVideo additionally VERIFIES the post changed
+  // and retries once, so a rare swallowed swipe self-heals.
   swipe: {
-    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.75),
-    endYFraction: parseFraction('SWIPE_END_FRACTION', 0.15),
-    durationMs: parsePositiveInt('SWIPE_DURATION_MS', 250),
+    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.65),
+    endYFraction: parseFraction('SWIPE_END_FRACTION', 0.25),
+    durationMs: parsePositiveInt('SWIPE_DURATION_MS', 300),
   },
 
   interactions: {

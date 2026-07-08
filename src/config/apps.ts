@@ -28,7 +28,13 @@ export type UiElementRole =
   /** Bottom-bar tab that opens the vertical video feed (IG: Reels tab; TikTok: Home). */
   | 'feedTab'
   /** Element whose PRESENCE proves we're on the video feed right now. */
-  | 'feedMarker';
+  | 'feedMarker'
+  /**
+   * Author/caption text node(s) of the CURRENT post — their combined text is a
+   * fingerprint used to verify a "next video" swipe actually advanced the feed
+   * (TikTok photo-mode posts silently swallow some swipe gestures).
+   */
+  | 'postTitle';
 
 export interface AppProfile {
   /** Stable identifier, also used as the persistence key suffix and `--app` value. */
@@ -111,10 +117,12 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       'On TikTok the red + badge under the avatar is shown ONLY when you do NOT follow the creator. ' +
       'If the avatar has a red + under it → NOT following. If the + badge is gone (just the round avatar) → ' +
       'already following.',
-    // TikTok opens into the feed and stays there — no periodic guard, no
-    // pre-action check needed (keeps the proven-fast TikTok path unchanged).
-    feedCheckInterval: 0,
-    guardBeforeActions: false,
+    // The guard used to be OFF here (it cost a slow vision call and TikTok
+    // rarely drifts) — but with the XML feed check it costs ~1s, and a crashed/
+    // backgrounded TikTok otherwise leaves the bot swiping the LAUNCHER forever
+    // (observed live). Check every 10 videos and before every like/comment.
+    feedCheckInterval: 10,
+    guardBeforeActions: true,
     // TikTok obfuscates resource-ids per build (id/fsb, id/eda…), but its
     // accessibility labels are rich and stable — match by content-desc regex
     // (Turkish + English UI variants). Captured from a live Samsung dump.
@@ -138,6 +146,9 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       feedTab: { contentDesc: '^(Ana sayfa|Home)$', clickable: true },
       // The For You tab label at the top exists only on the FYP feed.
       feedMarker: { contentDesc: '^(Sizin İçin|For You)$' },
+      // Author name + caption share this stable id — combined they fingerprint
+      // the current post for swipe verification.
+      postTitle: { resourceId: 'com.zhiliaoapp.musically:id/title' },
     },
     likedStateDescRegex: 'vazgeç|unlike',
   },
@@ -185,6 +196,8 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       feedTab: { resourceId: 'com.instagram.android:id/clips_tab' },
       // Present only while the full-screen Reels player is showing.
       feedMarker: { resourceId: 'com.instagram.android:id/clips_video_container' },
+      // The creator's username — fingerprints the current reel for swipe verification.
+      postTitle: { resourceId: 'com.instagram.android:id/clips_author_username' },
     },
     likedStateDescRegex: 'vazgeç|unlike',
   },

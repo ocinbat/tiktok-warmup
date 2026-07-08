@@ -125,12 +125,16 @@ export const matchesSelector = (node: UiTreeNode, selector: UiSelector): boolean
  * control), then the SMALLEST area wins (the most specific node, not a
  * full-screen wrapper that happens to match).
  */
-export const findUiElement = (xml: string, selector: UiSelector): UiTreeNode | null => {
-  const candidates = parseUiTree(xml).filter(
+/** ALL nodes matching a selector (usable, on-screen bounds only), document order. */
+export const findUiElements = (xml: string, selector: UiSelector): UiTreeNode[] =>
+  parseUiTree(xml).filter(
     // Off-screen nodes (negative center) are not tappable — `input tap` rejects
     // negative coordinates. Mirrors the vision path's out-of-bounds rejection.
     (n) => n.center !== null && n.center.x >= 0 && n.center.y >= 0 && matchesSelector(n, selector),
   );
+
+export const findUiElement = (xml: string, selector: UiSelector): UiTreeNode | null => {
+  const candidates = findUiElements(xml, selector);
   if (candidates.length === 0) return null;
   const area = (n: UiTreeNode): number =>
     n.bounds ? (n.bounds.x2 - n.bounds.x1) * (n.bounds.y2 - n.bounds.y1) : Number.MAX_SAFE_INTEGER;
