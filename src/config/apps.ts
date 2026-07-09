@@ -97,6 +97,15 @@ export interface AppProfile {
    * read (vision fallback is used instead).
    */
   likedStateDescRegex: string;
+  /**
+   * True when the follow control DISAPPEARS from the view hierarchy once you
+   * already follow the creator (TikTok: the red "+" badge under the avatar is
+   * only rendered while NOT following). For such apps, "followButton selector
+   * matches nothing" + "we're on a normal feed" = already following — decided
+   * deterministically, no vision needed. False for apps whose follow control is
+   * always present and merely changes its label (Instagram's follow button).
+   */
+  followAbsentMeansFollowing: boolean;
 }
 
 export const APP_PROFILES: Record<AppId, AppProfile> = {
@@ -151,6 +160,9 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       postTitle: { resourceId: 'com.zhiliaoapp.musically:id/title' },
     },
     likedStateDescRegex: 'vazgeç|unlike',
+    // The red "+" badge is only present while NOT following → its absence on a
+    // normal feed means already following (no vision needed to confirm).
+    followAbsentMeansFollowing: true,
   },
   instagram: {
     id: 'instagram',
@@ -200,6 +212,9 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       postTitle: { resourceId: 'com.instagram.android:id/clips_author_username' },
     },
     likedStateDescRegex: 'vazgeç|unlike',
+    // Instagram's inline follow button is ALWAYS present; its label carries the
+    // state ("Takip Et" vs "Takip"/"Following"), so absence never means following.
+    followAbsentMeansFollowing: false,
   },
 };
 

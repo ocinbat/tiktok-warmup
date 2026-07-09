@@ -32,10 +32,13 @@ export const NicheFollowAnalysisSchema = z.object({
   screenLooksLikeNormalFeed: z.boolean().describe('true if this is a normal full-screen feed video (NOT a shop, profile page, ad, popup, DM, search, etc.)'),
   matchesNiche: z.boolean().describe('true ONLY if the video/creator is clearly about the target niche'),
   isTargetLanguage: z.boolean().describe('true ONLY if the creator/content is primarily in the target language'),
-  followButtonText: z.string().describe('The EXACT text shown on the follow button/control, copied verbatim (e.g. "Takip Et", "Takip", "Follow", "Following"). Use "" only if there is genuinely no follow button or you cannot read it.'),
-  alreadyFollowing: z.boolean().describe('true if we ALREADY follow this creator. Decide from followButtonText: "Takip Et"/"Follow" = NOT following; bare "Takip"/"Takip Ediliyor"/"Following" = already following.'),
   creatorNote: z.string().describe('short note: creator handle/username and what the video is about'),
   confidence: z.string().describe('Confidence level: high/medium/low'),
+  // Follow STATE is no longer judged by the model — the view hierarchy decides
+  // it deterministically. Kept optional/defaulted so a model that still returns
+  // them doesn't fail validation; nothing reads them.
+  followButtonText: z.string().default('').optional(),
+  alreadyFollowing: z.boolean().default(false).optional(),
 });
 
 /**
@@ -577,38 +580,45 @@ export class WorkingStage {
 
     try {
       logger.info(`🔎 [Working] Niche-follow scan (niche="${follow.niche}", language=${follow.language})`);
+      // Vision judges ONLY the subjective call: niche + language + normal feed.
       const analysis = await this.analyzeForNicheFollow();
-      // Follow state, most reliable source first:
-      // 1. The follow control's OWN text/label read from the view hierarchy
-      //    (ground truth — Instagram's button text, TikTok's badge desc).
-      // 2. The exact button text the vision model transcribed.
-      // 3. The model's boolean (it keeps misreading "Takip Et" as "Takip").
-      const xmlFollowNode = await this.findXmlElement('followButton');
-      const xmlButtonText = xmlFollowNode ? (xmlFollowNode.text || xmlFollowNode.contentDesc) : undefined;
-      const interpreted = interpretFollowState(xmlButtonText) ?? interpretFollowState(analysis.followButtonText);
-      const alreadyFollowing = interpreted ?? analysis.alreadyFollowing;
-      const stateSource = interpretFollowState(xmlButtonText) !== undefined
-        ? 'uiautomator'
-        : interpreted !== undefined ? 'button text' : 'model';
       logger.info(
         `🔎 [Working] Follow scan: niche=${analysis.matchesNiche} lang=${analysis.isTargetLanguage} ` +
-          `button="${xmlButtonText ?? analysis.followButtonText}" alreadyFollowing=${alreadyFollowing} (${stateSource}) ` +
           `normalFeed=${analysis.screenLooksLikeNormalFeed} (${analysis.confidence}) — ${analysis.creatorNote}`,
       );
 
       if (!analysis.screenLooksLikeNormalFeed) return;
       if (!analysis.matchesNiche || !analysis.isTargetLanguage) return;
-      if (alreadyFollowing) {
-        logger.info(`➡️ [Working] Already following this ${follow.language} ${follow.niche.split(' ')[0]} creator (button="${analysis.followButtonText}"); skipping`);
-        return;
-      }
 
-      const followed = await this.executeFollow();
-      if (followed) {
-        this.stats.followsGiven++;
-        logger.info(`➕ [Working] Followed creator (${this.stats.followsGiven}/${follow.dailyLimit} this session): ${analysis.creatorNote}`);
-      } else {
-        logger.warn(`⚠️ [Working] Follow attempt not confirmed; leaving as-is`);
+      // Follow STATE + tap are 100% deterministic from the view hierarchy — no
+      // more vision. This is where the old flow burned ~30s of AI per scan
+      // (a redundant follow-button read PLUS a vision-agent tap) just to often
+      // conclude "already following".
+      const outcome = await this.followViaXml();
+      switch (outcome) {
+        case 'already':
+          logger.info(`➡️ [Working] Already following this ${follow.language} ${follow.niche.split(' ')[0]} creator (via uiautomator); skipping`);
+          return;
+        case 'followed':
+          this.stats.followsGiven++;
+          logger.info(`➕ [Working] Followed creator (${this.stats.followsGiven}/${follow.dailyLimit} this session): ${analysis.creatorNote}`);
+          return;
+        case 'failed':
+          logger.warn(`⚠️ [Working] Follow attempt not confirmed; leaving as-is`);
+          return;
+        case 'unresolved': {
+          // Rare: the view hierarchy couldn't resolve the control (e.g. a
+          // transient empty dump). One vision-agent attempt as a last resort.
+          logger.info(`🔎 [Working] Follow control unresolved from XML; falling back to vision agent once`);
+          const followed = await this.executeFollowViaAgent();
+          if (followed) {
+            this.stats.followsGiven++;
+            logger.info(`➕ [Working] Followed creator via vision fallback (${this.stats.followsGiven}/${follow.dailyLimit}): ${analysis.creatorNote}`);
+          } else {
+            logger.warn(`⚠️ [Working] Follow attempt not confirmed (vision fallback); leaving as-is`);
+          }
+          return;
+        }
       }
     } catch (error) {
       // A follow scan must never break the main loop.
@@ -621,28 +631,30 @@ export class WorkingStage {
    */
   private async analyzeForNicheFollow(): Promise<z.infer<typeof NicheFollowAnalysisSchema>> {
     const { follow, app } = this.presets;
-    const prompt = `You are a ${app.displayName} audience-growth analyst. Decide whether we should FOLLOW the creator of the CURRENT video.
+    // NOTE: this vision pass judges ONLY the subjective call — niche + language.
+    // Follow STATE (do we already follow?) and the follow TAP are handled
+    // deterministically from the view hierarchy by the caller, so we do NOT ask
+    // the model to read the follow button (it was slow AND frequently wrong).
+    const prompt = `You are a ${app.displayName} audience-growth analyst. Judge whether the creator of the CURRENT video is worth following, based on CONTENT ONLY.
 
 We follow a creator ONLY when BOTH are true:
   • the video/creator is about this niche: ${follow.niche}
   • the content is primarily in this language: ${follow.language}
-…and we do NOT already follow them.
 
 **CRITICAL: YOU MUST CALL finish_task AS YOUR FINAL STEP!**
 
-**Workflow (use take_and_analyze_screenshot with ONE query per call; do NOT tap anything — this is analysis only):**
+**Workflow (ONE screenshot; do NOT tap anything — this is analysis only):**
 1. take_and_analyze_screenshot(query="Describe this ${app.displayName} video: its main topic/niche, the language of the caption / on-screen text / speech, and the creator's username/handle.", action="answer_question")
-2. take_and_analyze_screenshot(query="Find the follow button/control for this creator and read its text. Report the EXACT text on it, copied letter-for-letter (for example: Takip Et, Takip, Follow, or Following).", action="answer_question")
-3. finish_task with all fields filled in.
+2. finish_task with the fields filled in.
 
 **RULES:**
 - matchesNiche = true ONLY if the video is clearly about: ${follow.niche}.
 - isTargetLanguage = true ONLY if the caption / speech / handle are primarily ${follow.language}.
-- followButtonText = the exact text you read on the follow button in step 2, copied verbatim.
-- alreadyFollowing: ${app.followStateHint}
+- screenLooksLikeNormalFeed = true if this is a normal full-screen feed video (not a shop, profile, ad, popup, DM, search…).
+- Do NOT look for or report the follow button — that is handled separately.
 - When unsure, set matchesNiche / isTargetLanguage to FALSE — do NOT follow when in doubt.
 
-**STOP RULE: Call finish_task once you have looked at the video content and the follow button text.**`;
+**STOP RULE: Call finish_task once you have described the video content.**`;
 
     return interactWithScreen<z.infer<typeof NicheFollowAnalysisSchema>>(
       prompt,
@@ -654,71 +666,75 @@ We follow a creator ONLY when BOTH are true:
   }
 
   /**
-   * Tap the follow control for the current creator and confirm the state changed.
-   * Deterministic path first: the follow control's live bounds + state from the
-   * view hierarchy (tap center, re-read to confirm). Falls back to the vision
-   * agent when the hierarchy can't resolve it.
+   * Fully deterministic follow (state read + tap + verify) from the view
+   * hierarchy — no vision. Outcomes:
+   * - 'already'    → we already follow this creator; nothing tapped.
+   * - 'followed'   → tapped a not-following control and confirmed it flipped.
+   * - 'failed'     → tapped but couldn't confirm (e.g. opened a profile page).
+   * - 'unresolved' → the hierarchy can't decide (empty dump); caller may use vision.
+   *
+   * Two ground-truth signals: (a) the follow control's OWN state, via
+   * interpretFollowState on its label; (b) for apps where the control vanishes
+   * when followed (TikTok's + badge), its ABSENCE on a normal feed = already
+   * following (app.followAbsentMeansFollowing).
    */
-  private async executeFollow(): Promise<boolean> {
-    const xmlResult = await this.executeFollowViaXml();
-    if (xmlResult !== undefined) return xmlResult;
-    return this.executeFollowViaAgent();
-  }
+  private async followViaXml(): Promise<'already' | 'followed' | 'failed' | 'unresolved'> {
+    const { app } = this.presets;
+    const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
+    if (!xml) return 'unresolved';
 
-  /**
-   * XML-deterministic follow. Returns:
-   * - true/false → handled here (tapped and confirmed / tapped but unconfirmed)
-   * - undefined  → hierarchy can't resolve the control; use the vision agent.
-   * Confirmation after the tap: Instagram's button text flips to the followed
-   * form ("Takip"/"Following"); TikTok's red + badge node DISAPPEARS entirely.
-   */
-  private async executeFollowViaXml(): Promise<boolean | undefined> {
-    const before = await this.findXmlElement('followButton');
-    if (!before?.center) return undefined;
+    const selector = app.xmlSelectors.followButton;
+    const node = selector ? findUiElement(xml, selector) : null;
 
-    const beforeState = interpretFollowState(before.text || before.contentDesc);
-    if (beforeState === true) {
-      // Already following — do NOT tap (it would unfollow).
-      logger.info(`➡️ [Working] Follow control already in followed state (via uiautomator); not tapping`);
-      return true;
+    if (!node?.center) {
+      // No follow control in the tree. For TikTok the + badge only exists while
+      // NOT following, so its absence on a genuine feed = already following.
+      if (app.followAbsentMeansFollowing && this.isFeedXml(xml) === true) {
+        return 'already';
+      }
+      return 'unresolved';
     }
 
-    logger.info(`➕ [Working] Tapping follow at (${before.center.x}, ${before.center.y}) [uiautomator, "${before.text || before.contentDesc}"]`);
-    await this.deviceManager.tapScreen(this.deviceId, before.center.x, before.center.y);
-    await this.wait(2, 'After follow tap');
+    // Control present — read its state from the label.
+    if (interpretFollowState(node.text || node.contentDesc) === true) {
+      return 'already'; // e.g. Instagram button reads "Takip"/"Following"
+    }
 
+    logger.info(`➕ [Working] Tapping follow at (${node.center.x}, ${node.center.y}) [uiautomator, "${node.text || node.contentDesc}"]`);
+    await this.deviceManager.tapScreen(this.deviceId, node.center.x, node.center.y);
+    await this.wait(2, 'After follow tap');
+    return this.verifyFollowedViaXml();
+  }
+
+  /** Confirm a follow tap registered, from a fresh dump. */
+  private async verifyFollowedViaXml(): Promise<'followed' | 'failed'> {
+    const { app } = this.presets;
     try {
       const xml = await this.deviceManager.dumpViewHierarchy(this.deviceId);
       if (!xml) {
-        // Dump went unusable right after a deterministic tap on a control we had
-        // POSITIVELY read as not-followed — count it as done rather than risking
-        // an agent retap that would unfollow.
+        // Unusable dump right after tapping a control we POSITIVELY read as
+        // not-following — assume it registered rather than risk a retap/unfollow.
         logger.info(`➕ [Working] Follow tapped; post-tap hierarchy unavailable, assuming it registered`);
-        return true;
+        return 'followed';
       }
-
-      // MUST end on the feed (the agent flow guaranteed this too). If the feed
-      // marker vanished, the tap most likely opened the creator's PROFILE page
-      // (on TikTok the + badge hugs the avatar's bottom edge) — the follow did
-      // NOT happen; press back to the feed and report failure.
-      const markerSelector = this.presets.app.xmlSelectors.feedMarker;
+      // MUST end on the feed: if the marker vanished, the tap likely opened the
+      // creator's PROFILE page (TikTok's + badge hugs the avatar) — not a follow.
+      const markerSelector = app.xmlSelectors.feedMarker;
       if (markerSelector && !findUiElement(xml, markerSelector)) {
-        logger.warn(`⚠️ [Working] Left the ${this.presets.app.feedName} after the follow tap (profile page likely opened); pressing back`);
+        logger.warn(`⚠️ [Working] Left the ${app.feedName} after the follow tap (profile page likely opened); pressing back`);
         await this.deviceManager.pressKey(this.deviceId, 'back');
         await this.wait(1.5, 'After back (recover from profile page)');
-        return false;
+        return 'failed';
       }
-
-      const selector = this.presets.app.xmlSelectors.followButton;
+      const selector = app.xmlSelectors.followButton;
       const after = selector ? findUiElement(xml, selector) : null;
-      if (!after) return true; // TikTok: the + badge is gone → followed
-      const afterState = interpretFollowState(after.text || after.contentDesc);
-      if (afterState === true) return true; // Instagram: text flipped → followed
+      if (!after) return 'followed'; // TikTok: the + badge is gone → followed
+      if (interpretFollowState(after.text || after.contentDesc) === true) return 'followed'; // IG: text flipped
       logger.warn(`⚠️ [Working] Follow control still reads "${after.text || after.contentDesc}" after the tap`);
-      return false;
+      return 'failed';
     } catch (error) {
       logger.debug(`[Working] Post-follow verification failed (non-fatal):`, error);
-      return true;
+      return 'followed';
     }
   }
 
