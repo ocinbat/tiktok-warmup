@@ -807,24 +807,27 @@ ${app.followButtonHint}
       const scrollDelay = this.getAdaptiveDelay(this.presets.video.scrollDelay);
       await this.wait(scrollDelay, 'Scroll delay between videos');
 
-      // Swipe verification: compare the current post fingerprint to the one
-      // after the previous swipe. Same = the gesture may have been swallowed
-      // (TikTok photo carousels do this). A null read (overlay hidden / transient
-      // dump failure) is inconclusive → skip this round.
-      //
-      // OBSERVE-ONLY for now: we LOG a suspected non-advance but do NOT re-swipe,
-      // because a false positive from a flaky fingerprint would SKIP a real video
-      // (the id/title fingerprint did exactly that — firing on every video). The
-      // 🔬 line prints prev vs current so a live run confirms the new avatar-based
-      // fingerprint changes correctly before we re-enable the auto re-swipe.
+      // Swipe verification: compare the current post's creator fingerprint to
+      // the one after the previous swipe. Same creator = the gesture was
+      // swallowed (a photo carousel captured it) → swipe once more. The avatar
+      // fingerprint is reliable (verified on-device to track each distinct
+      // creator), so this fires only on a GENUINE non-advance, never on every
+      // video the way the old id/title fingerprint did. A null read (overlay
+      // hidden / transient dump failure) is inconclusive → skip this round and
+      // never overwrite a good prior fingerprint.
       const fingerprint = await this.readPostFingerprint();
       if (fingerprint !== null && this.lastPostFingerprint !== null && fingerprint === this.lastPostFingerprint) {
-        logger.warn(`⚠️ [Working] Swipe gönderiyi İLERLETMEMİŞ OLABİLİR (aynı parmak izi) — gözlem modu, müdahale yok`);
+        logger.warn(`⚠️ [Working] Swipe gönderiyi İLERLETMEDİ (aynı içerik: "${fingerprint}") — bir kez daha kaydırılıyor`);
+        await this.deviceManager.swipeScreen(this.deviceId, centerX, startY, centerX, endY, durationMs);
+        await this.wait(Math.max(1.5, scrollDelay * 0.5), 'After retry swipe');
+        const after = await this.readPostFingerprint();
+        if (after !== null && after === fingerprint) {
+          logger.warn(`⚠️ [Working] Retry de ilerletemedi — bir sonraki döngüde tekrar denenecek`);
+        }
+        if (after !== null) this.lastPostFingerprint = after;
+      } else {
+        if (fingerprint !== null) this.lastPostFingerprint = fingerprint;
       }
-      logger.info(`🔬 [Working] Swipe fingerprint: önce="${this.lastPostFingerprint ?? '∅'}" → sonra="${fingerprint ?? '∅'}"`);
-      // Only advance the reference when we actually read something; a null read
-      // must not overwrite a good prior fingerprint.
-      if (fingerprint !== null) this.lastPostFingerprint = fingerprint;
 
       return true;
     } catch (error) {
