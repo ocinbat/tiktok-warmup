@@ -155,9 +155,11 @@ export const APP_PROFILES: Record<AppId, AppProfile> = {
       feedTab: { contentDesc: '^(Ana sayfa|Home)$', clickable: true },
       // The For You tab label at the top exists only on the FYP feed.
       feedMarker: { contentDesc: '^(Sizin İçin|For You)$' },
-      // Author name + caption share this stable id — combined they fingerprint
-      // the current post for swipe verification.
-      postTitle: { resourceId: 'com.zhiliaoapp.musically:id/title' },
+      // Swipe-advance fingerprint: the creator AVATAR's content-desc ("X profili")
+      // is a clean, single-per-visible-post identity. (id/title was a poor choice
+      // — it's shared by the author row, caption AND music label, and vanishes
+      // when the overlay auto-hides, so it fingerprinted inconsistently.)
+      postTitle: { resourceId: 'com.zhiliaoapp.musically:id/user_avatar' },
     },
     likedStateDescRegex: 'vazgeç|unlike',
     // The red "+" badge is only present while NOT following → its absence on a
