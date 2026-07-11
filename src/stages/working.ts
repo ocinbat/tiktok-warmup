@@ -141,6 +141,12 @@ export class WorkingStage {
    * "watches" the same carousel forever.
    */
   private lastPostFingerprint: string | null = null;
+  /**
+   * How many consecutive scroll attempts have failed to advance the feed. After
+   * a few, a heavier "refresh the feed" recovery kicks in so a pathological post
+   * (a forced-view ad, a hung carousel) can never trap the bot indefinitely.
+   */
+  private stuckStreak = 0;
 
   constructor(
     deviceId: string, 
@@ -768,6 +774,26 @@ ${app.followButtonHint}
   }
 
   /**
+   * Heavy anti-stuck recovery: tap the app's feed tab to refresh the feed. On
+   * TikTok tapping "Ana sayfa"/Home while on For You jumps to a fresh video; on
+   * Instagram re-tapping the Reels tab does the same. Deterministic (XML bounds),
+   * no vision. Best-effort — any failure is swallowed so the loop continues.
+   */
+  private async refreshFeedTab(): Promise<void> {
+    try {
+      const tab = await this.findXmlElement('feedTab');
+      if (tab?.center) {
+        await this.deviceManager.tapScreen(this.deviceId, tab.center.x, tab.center.y);
+        await this.wait(2, 'After feed-tab refresh tap');
+      } else {
+        logger.debug(`[Working] refreshFeedTab: feed tab not found in hierarchy`);
+      }
+    } catch (error) {
+      logger.debug(`[Working] refreshFeedTab failed (non-fatal):`, error);
+    }
+  }
+
+  /**
    * Fingerprint of the CURRENT post (author + caption text via the app's
    * postTitle selector). null = can't read right now (no selector / dump
    * unusable) — the caller skips verification for that round.
@@ -816,17 +842,34 @@ ${app.followButtonHint}
       // hidden / transient dump failure) is inconclusive → skip this round and
       // never overwrite a good prior fingerprint.
       const fingerprint = await this.readPostFingerprint();
-      if (fingerprint !== null && this.lastPostFingerprint !== null && fingerprint === this.lastPostFingerprint) {
-        logger.warn(`⚠️ [Working] Swipe gönderiyi İLERLETMEDİ (aynı içerik: "${fingerprint}") — bir kez daha kaydırılıyor`);
-        await this.deviceManager.swipeScreen(this.deviceId, centerX, startY, centerX, endY, durationMs);
-        await this.wait(Math.max(1.5, scrollDelay * 0.5), 'After retry swipe');
+      let advanced = fingerprint === null || this.lastPostFingerprint === null || fingerprint !== this.lastPostFingerprint;
+      if (!advanced) {
+        // ESCALATE — do NOT repeat the identical gesture (that looped forever on
+        // a full-screen carousel). A stronger, faster flick from nearer the nav
+        // bar (86% → 12% in 120ms) is the most reliable "this is a feed scroll,
+        // not a photo pan" signal.
+        const escStartY = Math.floor(screenSize.height * 0.86);
+        const escEndY = Math.floor(screenSize.height * 0.12);
+        logger.warn(`⚠️ [Working] Swipe gönderiyi İLERLETMEDİ (aynı içerik: "${fingerprint}") — daha güçlü flick ile tekrar`);
+        await this.deviceManager.swipeScreen(this.deviceId, centerX, escStartY, centerX, escEndY, 120);
+        await this.wait(Math.max(1.5, scrollDelay * 0.5), 'After escalated retry swipe');
         const after = await this.readPostFingerprint();
-        if (after !== null && after === fingerprint) {
-          logger.warn(`⚠️ [Working] Retry de ilerletemedi — bir sonraki döngüde tekrar denenecek`);
-        }
+        advanced = after === null || after !== fingerprint;
         if (after !== null) this.lastPostFingerprint = after;
-      } else {
-        if (fingerprint !== null) this.lastPostFingerprint = fingerprint;
+      } else if (fingerprint !== null) {
+        this.lastPostFingerprint = fingerprint;
+      }
+
+      // Heavy anti-stuck: if several scrolls in a row failed to advance (a
+      // forced-view ad, a hung carousel), refresh the feed by tapping the feed
+      // tab so we can never be trapped forever.
+      if (advanced) {
+        this.stuckStreak = 0;
+      } else if (++this.stuckStreak >= 3) {
+        logger.warn(`⚠️ [Working] ${this.stuckStreak} kez üst üste ilerlemedi — feed sekmesine basıp tazeleniyor`);
+        await this.refreshFeedTab();
+        this.stuckStreak = 0;
+        this.lastPostFingerprint = await this.readPostFingerprint();
       }
 
       return true;

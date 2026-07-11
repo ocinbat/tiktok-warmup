@@ -155,20 +155,19 @@ export const AUTOMATION_PRESETS: AutomationPresets = {
     scrollDelay: [1, 3],      // Wait 1-3 seconds between videos
   },
 
-  // Swipe STARTS BELOW the photo (80% down) and flicks up to 28% — measured
-  // on-device as the shape that advances TikTok photo-carousel posts. Those
-  // posts fill the screen with a (often tall) image spanning ~0-64% of the
-  // height; a swipe that BEGINS inside that image is captured by the photo's
-  // own pan/paging handler and the feed never moves (0.65→0.25 and even the
-  // right-edge / fast-flick variants all stalled on a real carousel). Starting
-  // at 80% is below the image but above the bottom nav (~88%) and sponsored
-  // posts' CTA banner (~89%+). scrollToNextVideo also VERIFIES the creator
-  // changed (avatar fingerprint) and retries once, covering the ~1-in-6 post
-  // (usually an ad) that still swallows the first gesture.
+  // A FAST FLICK (83% → 22% of the height in 150ms). Speed is the key variable:
+  // some TikTok photo-carousels fill the WHOLE content area (image spans 0→88%,
+  // down to the nav bar), so there is no "below the image" dead zone — a SLOW
+  // swipe anywhere on them is read as a photo pan and the feed never moves
+  // (this is what stalled the bot after ~1000 posts). A fast, long flick is
+  // recognized as a feed scroll instead: on-device it advanced 11/12 posts
+  // across 7 carousels, vs a hard stall for the slow 0.80→0.28@250 gesture.
+  // scrollToNextVideo VERIFIES the creator changed (avatar fingerprint) and, if
+  // not, retries with an even more aggressive flick — so no post stays stuck.
   swipe: {
-    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.80),
-    endYFraction: parseFraction('SWIPE_END_FRACTION', 0.28),
-    durationMs: parsePositiveInt('SWIPE_DURATION_MS', 250),
+    startYFraction: parseFraction('SWIPE_START_FRACTION', 0.83),
+    endYFraction: parseFraction('SWIPE_END_FRACTION', 0.22),
+    durationMs: parsePositiveInt('SWIPE_DURATION_MS', 150),
   },
 
   interactions: {
